@@ -1,0 +1,26 @@
+Metadata-Version: 2.4
+Name: classroom-agent
+Version: 0.4.0
+Summary: Read-only Google Classroom foundation
+Requires-Python: >=3.11
+Requires-Dist: pypdf<7,>=6.19
+Requires-Dist: defusedxml<1,>=0.7
+Requires-Dist: requests<3,>=2.33
+Requires-Dist: sqlalchemy<3,>=2.0
+Requires-Dist: google-api-python-client<3,>=2.150
+Requires-Dist: google-auth<3,>=2.35
+Requires-Dist: google-auth-oauthlib<2,>=1.2
+Requires-Dist: google-auth-httplib2<1,>=0.2
+Requires-Dist: httplib2<1,>=0.22
+Requires-Dist: pydantic<3,>=2.9
+Requires-Dist: python-dotenv<2,>=1
+Requires-Dist: typer<1,>=0.15
+Requires-Dist: rich<15,>=13.9
+Requires-Dist: tzdata>=2024.2
+Requires-Dist: oauthlib<4,>=3.2
+Provides-Extra: dev
+Requires-Dist: pytest<10,>=8; extra == "dev"
+Requires-Dist: ruff<1,>=0.9; extra == "dev"
+Requires-Dist: mypy<2,>=1.14; extra == "dev"
+Requires-Dist: types-defusedxml; extra == "dev"
+Requires-Dist: types-requests; extra == "dev"
