@@ -1,322 +1,201 @@
-# Classroom Agent — Fases 1–4
+# Classroom Agent
 
-CLI Python 3.11+ somente leitura: Classroom v1, SQLite/SQLAlchemy, Drive v3 e
-extração local de anexos. A Fase 4 acrescenta Context Discovery, leitura oficial
-somente-leitura de Forms quando possível, provider Mock/Astra e soluções estruturadas
-versionadas para revisão humana. Não há turn-in, envio de Forms ou escrita no Google.
+Agente local em Python para consultar o Google Classroom como aluno, sincronizar dados para SQLite, descobrir contexto de atividades, preparar soluções estruturadas com LLM, gerar PDFs revisáveis e, na Fase 5, enviar esses PDFs para uma pasta controlada do Google Drive.
 
-## Fase 4
+## Visão geral e fluxo
 
-### Gemini sem compra de créditos
+`Google Classroom → sync/persistência SQLite → context discovery → LLM/solução estruturada → DocumentBuilder → PDF → Google Drive`
 
-O provider `gemini` usa a Gemini Developer API (`generateContent`) com JSON,
-sem ferramentas. Crie uma chave em https://aistudio.google.com/apikey num projeto
-**Free Tier**, sem habilitar faturamento. A faixa gratuita tem limites; uma chave
-de projeto pago segue o faturamento desse projeto. O código não verifica nem altera
-o plano. Na faixa gratuita, conteúdo pode ser usado pelo Google para melhorar produtos.
+O Classroom fornece cursos, atividades, submissões e referências a materiais. `sync` mantém um snapshot local; a descoberta de contexto reúne descrição, links, Forms e anexos extraídos com provenance, limites e sanitização; `solve` grava uma resposta estruturada versionada; `generate` escolhe um template e cria um PDF; `upload` envia somente esse PDF para a pasta de respostas configurada.
 
-No arquivo **`.env`**, e não em `.env.example`, configure:
+## Funcionalidades por fase
 
-```dotenv
-LLM_PROVIDER=gemini
-GEMINI_API_KEY=sua-chave-do-google-ai-studio
-GEMINI_MODEL=gemini-3.8-flash
-GEMINI_TIMEOUT_SECONDS=120
-```
+- **Fase 1:** cliente Classroom somente leitura, autenticação OAuth Desktop, listagem de cursos e atividades, status de submissões, tratamento de prazos e configuração por `.env`.
+- **Fase 2:** sincronização incremental e idempotente em SQLite, preservação de snapshots e payloads, tombstones para registros removidos, anexos persistidos e leitura local.
+- **Fase 3:** descoberta, download seguro e extração local de anexos suportados, com limites de tamanho, hash, estados, histórico e proteção contra conteúdo não confiável.
+- **Fase 4:** descoberta de contexto canônico para atividades, leitura opcional de Google Forms, provenance, orçamento de contexto, soluções estruturadas validadas por schema, providers `mock`, Gemini e Astra/OpenAI-compatible, versionamento e comparação por hash.
+- **Fase 5:** `DocumentBuilder` com PDFs versionados, templates `QUESTION_ANSWER`, `ACADEMIC_REPORT` e `CODE_ASSIGNMENT`, persistência de artifacts, organização no Drive por disciplina e upload explícito com scope mínimo `drive.file`.
 
-Execute `python main.py solve 8 --provider gemini`. A validação, o versionamento,
-o reparo limitado e a revisão humana são os mesmos. Não há fallback para API paga.
-Documentação: https://ai.google.dev/gemini-api/docs/pricing e
-https://ai.google.dev/api/generate-content .
+## Arquitetura
 
-```powershell
-python main.py context <id>
-python main.py context <id> --json
-python main.py solve <id> --provider mock
-python main.py solutions <id>
-```
+`app/classroom` acessa a API do Classroom; `app/sync.py` coordena a sincronização; `app/persistence` define banco, modelos e leitor local; `app/attachments` descobre, baixa e extrai materiais; `app/context` monta o contexto seguro; `app/llm` chama o provider e valida a solução; `app/documents` renderiza e envia PDFs; `app/cli` expõe a interface Typer.
 
-`description` é fonte primária: uma atividade description-only pode ficar `Ready for
-AI: SIM` sem anexos. Forms detectado sem perguntas oficiais disponíveis fica
-`FORM_DETECTED_BUT_QUESTIONS_UNAVAILABLE` e bloqueia `solve`, exceto quando a
-description já é suficiente. O texto de professores, Forms, links e anexos entra
-como `UNTRUSTED_DATA`; o provider só produz JSON validado e toda solução fica
-`NEEDS_REVIEW`.
+## Stack
 
-O provider padrão é `mock` e não chama rede. Para usar Astra localmente, configure
-`ASTRA_API_KEY` e `LLM_PROVIDER=astra`; a implementação usa a Responses API oficial,
-`gpt-6-astra`, `store=false`, sem tools, e exige saída JSON Schema. O acesso do
-modelo no Work não autentica automaticamente este processo local.
+Python 3.11+, Typer, Rich, SQLAlchemy 2, SQLite, Pydantic 2, Google API Client/Auth, `python-dotenv`, `pypdf`, ReportLab, Requests. Ferramentas de desenvolvimento: Ruff, mypy e pytest.
 
-Para testar uma atividade description-only real:
+## Requisitos
+
+- Windows com PowerShell e Python 3.11 ou superior.
+- Projeto Google Cloud com APIs Google Classroom, Google Drive e, se Forms for usado, Google Forms habilitadas.
+- Credencial OAuth do tipo **Desktop app** salva como `credentials.json` (ou no caminho definido por `GOOGLE_CREDENTIALS_FILE`).
+- Conta com acesso às disciplinas e aos arquivos que serão consultados.
+- Para upload, a conta precisa conceder o scope `drive.file`.
+
+## Instalação no Windows/PowerShell
 
 ```powershell
-python main.py sync
-python main.py local-assignments
-python main.py context ID
-python main.py solve ID --provider mock
-python main.py solutions ID
-```
-
-Nenhum desses comandos submete a atividade ou responde o Forms.
-
-## Instalação
-
-Na raiz do projeto:
-
-```powershell
-python -m venv .venv
-.venv\Scripts\python.exe -m pip install -e ".[dev]"
+git clone <URL_DO_REPOSITORIO>
+cd classroom-agent-fase4
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -e ".[dev]"
 Copy-Item .env.example .env
 ```
 
-Use `.venv\Scripts\python.exe` no lugar de `python` nos próximos comandos,
-ou ative o ambiente com `.venv\Scripts\Activate.ps1`.
-Linux/macOS: `source .venv/bin/activate` e `cp .env.example .env`.
-Instalação sem ferramentas de desenvolvimento: `python -m pip install -r requirements.txt`.
+Se a política do PowerShell impedir a ativação, use a sessão atual com `Set-ExecutionPolicy -Scope Process Bypass` ou invoque diretamente `.\.venv\Scripts\python.exe`.
 
-## Migração e reautenticação
+### Instalação Python
 
-1. Encerre processos que usem o banco anterior. Faça backup do arquivo configurado
-   em `DATABASE_FILE` na Fase 2. O padrão é `data/classroom.db`.
-2. Para usar esta nova pasta, copie o banco anterior para `data/classroom.db` nela.
-   Copie seu `credentials.json` OAuth Desktop. Não copie caches ou `.venv`.
-   Se usar caminhos diferentes, ajuste `DATABASE_FILE` e `GOOGLE_CREDENTIALS_FILE`.
-3. No [Google Cloud Console](https://console.cloud.google.com/), selecione o projeto
-   do cliente OAuth. Habilite **Google Classroom API** e **Google Drive API**.
-   Configure consentimento e Test users quando aplicável. Contas escolares podem
-   precisar de autorização do administrador para o novo scope.
-4. Se já existir token nesta pasta, renomeie o arquivo efetivamente configurado em
-   `GOOGLE_TOKEN_FILE`. Para o padrão:
+Em qualquer ambiente Python 3.11+, crie um ambiente virtual e instale:
+
+```bash
+python -m venv .venv
+python -m pip install -e ".[dev]"
+```
+
+`requirements.txt` contém as dependências de runtime; o `pyproject.toml` é a fonte da instalação do pacote e do extra de desenvolvimento.
+
+## Configuração
+
+Copie `.env.example` para `.env`. As variáveis principais são:
+
+| Variável | Uso |
+| --- | --- |
+| `DATABASE_FILE` | SQLite local, por padrão `data/classroom.db`. |
+| `GOOGLE_CREDENTIALS_FILE` | JSON OAuth Desktop baixado do Google Cloud. |
+| `GOOGLE_TOKEN_FILE` | Token OAuth local, por padrão `token.json`. |
+| `TIMEZONE` | Fuso usado para exibir prazos. |
+| `GENERATED_ROOT` | Raiz dos PDFs gerados. |
+| `LLM_PROVIDER` | Provider configurado; `mock` é seguro para testes locais. |
+| `GEMINI_API_KEY`, `GEMINI_MODEL` | Credencial e modelo Gemini, quando usado. |
+| `ASTRA_API_KEY`, `ASTRA_BASE_URL`, `ASTRA_MODEL` | Provider compatível com API OpenAI, quando usado. |
+| `CONTEXT_MAX_CHARS` | Limite do contexto montado. |
+| `DRIVE_RESPONSES_FOLDER_ID` | ID da pasta raiz controlada para respostas; vazio cria/encontra `DRIVE_RESPONSES_FOLDER_NAME`. |
+| `DRIVE_RESPONSES_FOLDER_NAME` | Nome usado quando o ID não é informado. |
+| `DRIVE_ORGANIZE_BY_COURSE` | Quando `true`, cria uma subpasta por disciplina. |
+
+Não coloque secrets no `.env.example`; use valores locais somente no `.env`.
+
+## Google Cloud, OAuth e scopes
+
+Habilite as APIs necessárias e crie credenciais OAuth Desktop. O fluxo de leitura solicita apenas:
+
+- `classroom.courses.readonly`;
+- `classroom.coursework.me.readonly`;
+- `classroom.student-submissions.me.readonly`;
+- `drive.readonly`.
+
+Para a Fase 5, o upload solicita adicionalmente somente `drive.file`, que permite criar e gerenciar os arquivos criados pelo agente. Execute `python main.py auth --write` quando precisar conceder esse scope. Se os scopes mudarem, renomeie ou remova apenas o arquivo indicado por `GOOGLE_TOKEN_FILE` e reautentique; não remova `credentials.json`.
+
+## Autenticação
 
 ```powershell
-if (Test-Path -LiteralPath token.json) {
-    Rename-Item -LiteralPath token.json -NewName ("token-fase2-" + (Get-Date -Format yyyyMMddHHmmss) + ".json")
-}
-python main.py auth --debug
+python main.py auth
+python main.py auth --write
 ```
 
-Mantenha `credentials.json`. Autorize a conta aluna que pode ler os anexos.
-O navegador abre apenas em `auth`. Confirme **Conta autenticada. Acesso somente
-leitura.** no terminal; a página de callback apenas confirma recebimento.
-Tokens renomeados continuam sendo secrets e não devem ser compartilhados.
-Renomear o token não revoga o consentimento no Google.
-
-Scopes solicitados:
-
-```text
-https://www.googleapis.com/auth/classroom.courses.readonly
-https://www.googleapis.com/auth/classroom.coursework.me.readonly
-https://www.googleapis.com/auth/classroom.student-submissions.me.readonly
-https://www.googleapis.com/auth/drive.readonly
-```
-
-Somente `drive.readonly` foi adicionado. Docs/Slides/Sheets são exportados pelo
-Drive, sem scopes extras dessas APIs. `drive.file` não é readonly e não atende
-à leitura geral dos anexos preexistentes. O aplicativo não enumera o Drive:
-consulta somente IDs presentes nos materiais persistidos do CourseWork.
-
-Tokens sem novos scopes são recusados antes de renovação/uso, com mensagem clara
-para reautenticar, inclusive em `sync`. A validação usa `granted_scopes`, preserva
-sua evidência no token e mantém a equivalência restrita dos aliases readonly do
-próprio aluno. Não desabilita verificações OAuth. O token é salvo atomicamente.
-Debug mostra scopes e booleanos, nunca valores de tokens/client secret.
-
-Abertura do SQLite migra `user_version` 0/1 para 2 de forma aditiva, criando
-`attachments`. As quatro tabelas anteriores, IDs e registros são preservados.
-Schemas incompatíveis/versões futuras são recusados. A Fase 2 não armazenava
-materiais: **execute sync novamente após migrar**, ou a tabela estará vazia.
-
-## Testar com uma atividade real
-
-Depois da instalação, cópia dos arquivos e reautenticação:
-
-```powershell
-python main.py sync
-python main.py courses
-python main.py assignments
-python main.py local-assignments
-```
-
-Confirme `Sync #...: SUCCESS`. Em `local-assignments`, escolha uma atividade que
-tenha documento acessível e anote seu **ID local inteiro**, não o ID Google.
-Substitua `123` abaixo pelo ID mostrado:
-
-```powershell
-$atividade = 123
-python main.py attachments $atividade
-python main.py fetch-attachments $atividade
-python main.py extract $atividade
-python main.py attachments $atividade
-```
-
-Espere `DOWNLOADED` após fetch e `EXTRACTED` após extract para formatos suportados,
-com caracteres/páginas e caminho. Links, YouTube, Forms e imagens podem mostrar
-`UNSUPPORTED` com motivo. Repita os comandos: IDs e caminhos devem permanecer
-estáveis, sem novo download se versão e arquivo local íntegro forem iguais.
-Altere um documento Drive sob seu controle e repita fetch/extract: bytes diferentes
-ganham novo hash/caminho; os anteriores permanecem. Para conferir remoção, retire
-um material de uma atividade que você pode editar na interface Google e execute
-sync: a listagem deve mostrar `REMOVED`, mantendo histórico.
-
-Testes automatizados não comprovam acesso da conta ou políticas da escola.
-`PARTIAL`/`FAILED` exige resolver a mensagem antes de assumir descoberta completa.
+O primeiro comando abre o navegador para os scopes de leitura. O segundo inclui `drive.file`. Comandos de leitura reutilizam e renovam o token local; nenhum token é impresso pelo CLI.
 
 ## CLI
 
-| Comando | Comportamento |
-|---|---|
-| `auth [--debug]` | OAuth Desktop readonly |
-| `sync` | Cursos, atividades, submissões e metadata dos materiais |
-| `courses`, `assignments`, `pending` | Snapshot SQLite |
-| Os mesmos com `--api` | Leitura Classroom direta, sem gravar banco |
-| `assignments --course ID_GOOGLE` | Filtro por disciplina, preservado |
-| `pending --include-archived` | Inclui disciplinas arquivadas |
-| `local-assignments` | IDs locais para operar anexos |
-| `attachments ID_LOCAL` | Metadata, URL sanitizada, Drive ID, presença/status e caminho |
-| `fetch-attachments ID_LOCAL` | Consulta Drive e obtém/exporta arquivos autorizados |
-| `extract ID_LOCAL` | Extração local; imprime somente resumo |
+Consulte sempre a ajuda instalada com `python main.py --help`. Os comandos atualmente disponíveis são:
 
-`attachments`, `extract` e `local-assignments` não autenticam nem usam rede.
-Fetch respeita `capabilities.canDownload`, lixeira e versão antes/depois da
-transferência. Extract exige fetch prévio e não usa bytes antigos após falha de
-permissão/mudança detectada. Falhas por anexo permitem continuar os demais e
-retornam código 1; `UNSUPPORTED` é resultado esperado. O snapshot é local:
-revogações de acesso só são conhecidas quando Drive é consultado novamente.
+```text
+auth [--write]
+sync
+courses [--include-archived] [--api]
+assignments [--course ID] [--include-archived] [--api]
+pending [--course ID] [--include-archived] [--api]
+local-assignments
+attachments ASSIGNMENT_LOCAL_ID
+fetch-attachments ASSIGNMENT_LOCAL_ID
+extract ASSIGNMENT_LOCAL_ID
+context ASSIGNMENT_LOCAL_ID [--offline] [--json]
+solve ASSIGNMENT_LOCAL_ID [--provider PROVIDER] [--offline]
+solutions ASSIGNMENT_LOCAL_ID [--offline]
+solution SOLUTION_ID
+generate ASSIGNMENT_LOCAL_ID [--template TEMPLATE] [--solution-version N] [--upload]
+artifacts ASSIGNMENT_LOCAL_ID
+upload ASSIGNMENT_LOCAL_ID
+```
 
-## Persistência e estados
+`--api` consulta o Classroom diretamente; sem ele, os comandos de consulta usam o snapshot local. IDs de anexos e atividades usados por `attachments`, `context`, `solve`, `generate` e `upload` são IDs inteiros locais, exibidos por `local-assignments`.
 
-`attachments`: ID inteiro, FK `assignment_id`, identidade única por atividade,
-tipo, título, Drive ID/URL, MIME original/materializado, caminho relativo,
-SHA-256, fingerprint de metadata materializada, payload sanitizado, metadata
-Drive permitida, status, erros seguros, texto estruturado, histórico JSON e
-timestamps UTC de descoberta/atualização/download/extração/remoção.
+### Fluxo completo
 
-Identidade usa tipo + Drive/video ID ou URL sanitizada. Material desconhecido
-sem identidade usa posição na lista; nesse caso, reordenação pode parecer
-alteração de slot. Repetições idênticas são deduplicadas. Mudança de material
-marca a atividade UPDATED. Remoção marca `present=false` e `removed_at`, sem
-apagar arquivos ou registros. Reaparecimento reutiliza o ID. Histórico preserva
-metadata/caminho/hash anteriores; texto antigo pode ser reconstruído dos bytes.
+```powershell
+python main.py auth
+python main.py sync
+python main.py local-assignments
+python main.py attachments 12
+python main.py fetch-attachments 12
+python main.py extract 12
+python main.py context 12 --json
+python main.py solve 12 --provider mock
+python main.py solutions 12
+python main.py generate 12 --template academic-report
+python main.py artifacts 12
+python main.py auth --write
+python main.py upload 12
+```
 
-Estados: DISCOVERED, DOWNLOADED, EXTRACTED, UNSUPPORTED, FAILED. Presença/remoção
-é independente do processamento. Curso/atividade ausente bloqueia novas operações
-e contexto. Descoberta compartilha a transação por disciplina; falha posterior
-em submissões reverte também anexos. SUCCESS/PARTIAL/FAILED, UPSERT, leitura local
-e --api permanecem. Fetch/extract serializam escritas com sync: outra operação
-pode aguardar o lock do SQLite durante arquivos lentos.
+Substitua `12` pelo ID local mostrado no seu banco. O provider `mock` não chama serviço externo e é útil para verificar o fluxo.
 
-## Formatos
+## Templates PDF
 
-| Origem | Obtenção | Extração |
-|---|---|---|
-| TXT/MD UTF-8 ou UTF-16 com BOM | files.get, alt=media | Texto literal |
-| PDF | files.get, alt=media | pypdf, texto por página |
-| DOCX | files.get, alt=media | XML seguro; parágrafos e texto de tabelas |
-| Google Docs | files.export, text/plain | TXT |
-| Google Slides / PPTX | Export PPTX / download | Texto por slide |
-| Google Sheets / XLSX | Export XLSX / download | Células por planilha/linha e valores em cache |
-| LINK/YOUTUBE/FORM/UNKNOWN | Somente metadata | Sem scraping/browser |
-| Imagens/outros binários | Somente metadata | UNSUPPORTED; imagens IMAGE_NO_OCR |
+- `question-answer`: lista cada pergunta e sua resposta; é o padrão para questões objetivas ou curtas.
+- `academic-report`: apresenta entendimento, resposta e itens de questões em formato de relatório.
+- `code-assignment`: inclui cabeçalho acadêmico, resposta e blocos de código/especificações em fonte monoespaçada.
 
-PDF sem texto: NO_TEXT_LAYER. PDF protegido: ENCRYPTED. Sem OCR, execução de
-scripts/macros/JavaScript, avaliação de fórmulas, Office automation ou chamadas
-a links externos dos documentos. Atalhos/pastas Drive não são seguidos.
-DOCX não extrai cabeçalhos/rodapés/notas; Slides não inclui notas do apresentador;
-Sheets usa planilhas numeradas, coordenadas e resultados em cache, sem converter
-estilos/datas nem recalcular fórmulas. Exportar Google Docs em TXT perde layout.
+O template pode ser escolhido com `--template`; sem override, o builder escolhe pelo tipo estruturado da solução.
 
-Requisições de download são construídas pelo discovery oficial Drive v3;
-transporte OAuth usa streaming limitado. URLs dos materiais/exportLinks nunca
-são destinos de download. Redirecionamentos são recusados. Exportação Drive tem
-limite próprio de 10 MB, mesmo quando o limite local for maior.
+## Drive e organização por disciplina
 
-## Segurança e configuração
+Defina `DRIVE_RESPONSES_FOLDER_ID` com o ID da pasta raiz. Com `DRIVE_ORGANIZE_BY_COURSE=true`, o agente cria ou reutiliza uma subpasta com o nome da disciplina e envia o PDF nela. Se o ID ficar vazio, o agente procura ou cria a pasta definida em `DRIVE_RESPONSES_FOLDER_NAME`. O upload é explícito e só aceita PDFs gerados dentro de `GENERATED_ROOT`.
 
-Pasta fixa da CLI: `data/attachments/<course-local-id>/<assignment-local-id>/`.
-Nomes contêm ID local, SHA-256 completo e nome sanitizado. Conteúdo igual reutiliza
-arquivo; conteúdo diferente ganha outro nome. Criação exclusiva não sobrescreve
-arquivo existente. Hash detecta adulteração: mova o arquivo adulterado para fora
-da pasta controlada antes de repetir fetch.
+## Persistência e estrutura
 
-- Allowlist de formatos; bloqueio de executáveis/scripts/macros, extensão dupla
-  e assinaturas executáveis. Texto extraído nunca é executado.
-- Proteção contra traversal, nomes reservados Windows, caminhos externos,
-  symlinks/junctions/hardlinks. Leitura exige nome gerado, IDs e hash correspondentes.
-- Extração recebe bytes validados, não caminhos arbitrários ou comandos.
-  `.env`, `credentials.json`, `token.json` não são anexos válidos. OAuth lê seus
-  arquivos configurados apenas para autenticação; não os inclui no contexto.
-- XML com defusedxml, sem entidades externas. ZIP não é extraído no filesystem:
-  verifica expansão, entradas, traversal, macros e objetos incorporados.
-- Parser em processo separado com timeout; não é sandbox de sistema operacional.
-  Limites de bytes não equivalem a teto exato de RAM. Mantenha bibliotecas atualizadas.
-- Resumos removem controles/markup; erros não expõem conteúdo bruto de API/parser.
-  URLs removem credenciais, fragmentos e parâmetros exceto id/v; isso pode
-  simplificar links cuja navegação dependa de outros parâmetros.
-- SQLite/anexos locais não são criptografados; no Windows proteção depende das
-  ACLs do usuário. Nenhum conteúdo é enviado a LLM ou serviço de IA.
+As tabelas principais são `courses`, `assignments`, `submissions`, `sync_runs`, `attachments`, `solutions` e `generated_artifacts`. `solutions` guarda versões, provider/modelo, hash do contexto, resposta estruturada e estado de revisão. `generated_artifacts` guarda template, versão, caminho, hash, estado e metadados do Drive.
 
-| Variável | Padrão |
-|---|---|
-| DATABASE_FILE | data/classroom.db |
-| GOOGLE_CREDENTIALS_FILE / GOOGLE_TOKEN_FILE | credentials.json / token.json |
-| TIMEZONE | America/Sao_Paulo |
-| HTTP_TIMEOUT_SECONDS | 30 (1–300) |
-| MAX_RETRIES | 3 (0–8) |
-| ATTACHMENT_MAX_BYTES | 20971520, até 100 MiB |
-| EXTRACTION_MAX_BYTES | 41943040, até 100 MiB; ZIP expandido/stream PDF |
-| EXTRACTION_MAX_CHARS | 1000000, até 5000000; documento e anexos do bundle |
-| EXTRACTION_TIMEOUT_SECONDS | 30 (1–120) |
+```text
+app/
+  auth/ classroom/ cli/ context/ domain/ documents/
+  attachments/ llm/ persistence/ sync.py config.py
+tests/
+data/                 # banco, anexos e PDFs locais
+main.py
+.env.example
+pyproject.toml
+```
 
-Também há limites de 5000 entradas ZIP e 2000 páginas PDF. Variáveis do processo
-prevalecem sobre `.env`; caminhos relativos resolvem contra a raiz do projeto.
-Retry com backoff/jitter só em 429, 500/502/503/504, falha de transporte e 403
-explicitamente classificado como rate limit. 401, 403 de acesso, 404, quota diária,
-scope insuficiente, API desativada e formato inválido não são repetidos.
+## Segurança
 
-## Contexto para a próxima fase
+Nunca versione `.env`, `credentials*.json`, `token*.json`, `data/` ou arquivos pessoais. O `.gitignore` do projeto cobre esses padrões. Revise anexos como dados não confiáveis, mantenha os scopes mínimos e não compartilhe tokens, IDs pessoais, e-mails ou PDFs privados.
 
-`app.attachments.context.build_context(engine, assignment_local_id, settings)`
-retorna ContextBundle com disciplina, título/enunciado, prazo, submissões e anexos
-presentes com seções extraídas. `to_dict()` serializa. Texto é encapsulado em
-`UntrustedText(trust="UNTRUSTED_DATA")`; ExtractedContent também carrega essa marca,
-schema, caracteres e páginas. Sem slots administrativos, prompts ou dispatch por
-texto. Payloads brutos, URLs, caminhos e credenciais são excluídos por allowlist.
-Isso preserva a fronteira de dados, sem prometer imunidade de um futuro LLM a
-prompt injection. Nenhum LLM foi conectado nesta fase.
+## Troubleshooting
 
-## Regras Classroom preservadas
+- **OAuth/scopes:** remova ou renomeie o token definido em `GOOGLE_TOKEN_FILE` e execute `python main.py auth` ou `python main.py auth --write` conforme o erro. Confira se a credencial é Desktop app.
+- **Drive API/upload:** habilite a Drive API, conceda `drive.file`, valide `DRIVE_RESPONSES_FOLDER_ID` e confira se o PDF está em `GENERATED_ROOT`.
+- **Contexto sem anexos:** rode `sync`, confira `local-assignments` e depois `attachments`, `fetch-attachments` e `extract`. Materiais removidos ou não suportados permanecem registrados com estado.
+- **Forms não acessível:** use `context ID --offline` para montar o contexto sem leitura da API de Forms; verifique API habilitada e permissões quando a leitura oficial for necessária.
+- **Banco/configuração:** confira caminhos relativos ao diretório do projeto, permissões de escrita em `data/` e o timezone configurado.
 
-NEW/CREATED/RECLAIMED_BY_STUDENT são PENDING, ou MISSING após o prazo.
-TURNED_IN permanece entregue; RETURNED com assignedGrade (inclusive zero) é GRADED,
-sem nota é RETURNED. Estado desconhecido/submissão ausente é UNKNOWN. Nota de
-rascunho não significa correção publicada. `late` original é separado do atraso
-calculado. Prazo é UTC na API, armazenado aware e exibido no timezone configurado.
-`dueTime={}` é meia-noite; só um dos campos de prazo ausente é inválido.
-
-## Verificação sem conta Google
+## Testes e qualidade
 
 ```powershell
 python -m ruff check .
-python -m ruff format --check .
-python -m mypy .
-python -m pytest -q
-python -m compileall -q app main.py
-python main.py --help
+python -m mypy app main.py
+python -m pytest
 ```
 
-Mocks ficam somente em tests/. Cobertura inclui regressões anteriores, migração
-v1, descoberta/rollback, identidade, remoção, filesystem/limites, discovery oficial,
-erros HTTP/retries, formatos, documentos corrompidos, cache, alteração durante
-download, revogação, contexto e CLI sem documentos no terminal.
+Esses comandos verificam lint, tipos e a suíte presente no repositório. O README não fixa uma quantidade de testes.
 
-Referências oficiais:
-[materiais Classroom](https://developers.google.com/workspace/classroom/reference/rest/v1/Material),
-[download/exportação](https://developers.google.com/workspace/drive/api/guides/manage-downloads),
-[formatos de exportação](https://developers.google.com/workspace/drive/api/guides/ref-export-formats),
-[scopes Drive](https://developers.google.com/workspace/drive/api/guides/api-specific-auth).
+## Limitações atuais
 
-Próxima fase: Fase 4 — Context Builder + Astra/LLM + resolução estruturada
-# Fase 5 — PDF e Drive
+Não há turn-in automático no Classroom, envio automático de respostas para Google Forms nem browser automation. O upload envia somente o PDF gerado para o Drive; revisão e decisão de entrega continuam manuais.
 
-Consulte [IMPLEMENTATION_REPORT_FASE5.md](IMPLEMENTATION_REPORT_FASE5.md) para os comandos `generate`, `artifacts` e `upload`, configuração de identidade, OAuth `drive.file` e procedimento de validação.
+## Próxima fase
+
+O próximo ciclo pode melhorar a experiência de revisão, ampliar observabilidade e cobertura de providers, adicionar mais formatos de documento e aprofundar integrações somente leitura, preservando o fluxo explícito e seguro de aprovação humana.
