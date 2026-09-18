@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Annotated, Any
 
 import typer
@@ -16,13 +17,15 @@ from app.auth.google import authenticate
 from app.classroom.client import ClassroomClient
 from app.config import load_settings
 from app.context.builder import build_assignment_context
+from app.documents.drive import DriveUploader
+from app.documents.engine import DocumentBuilder
 from app.domain.models import SubmissionStatus
 from app.domain.status import is_overdue, normalize_status
 from app.errors import AppError
 from app.llm.providers import get_provider
 from app.llm.service import list_solutions, solve_context
 from app.persistence.database import open_database
-from app.persistence.models import AssignmentRecord
+from app.persistence.models import AssignmentRecord, SolutionRecord
 from app.persistence.reader import LocalReader
 from app.sync import synchronize
 
@@ -92,7 +95,15 @@ def sync(ctx: typer.Context) -> None:
 
 
 @app.command()
-def auth(ctx: typer.Context, debug: bool = False) -> None:
+def auth(
+    ctx: typer.Context,
+    debug: bool = False,
+    write: bool = typer.Option(
+        False,
+        "--write",
+        help="Solicita também o escopo mínimo drive.file para upload de PDFs.",
+    ),
+) -> None:
     """Autoriza a conta Google e salva/renova o token local."""
     try:
         debug = debug or bool(ctx.obj and ctx.obj.get("debug"))
@@ -101,8 +112,16 @@ def auth(ctx: typer.Context, debug: bool = False) -> None:
         def diagnostic(message: str) -> None:
             errors.print(Text(message))
 
-        authenticate(load_settings(), interactive=True, diagnostic=diagnostic if debug else None)
-        console.print("Conta autenticada. Acesso somente leitura.")
+        authenticate(
+            load_settings(),
+            interactive=True,
+            diagnostic=diagnostic if debug else None,
+            require_write=write,
+        )
+        console.print(
+            "Conta autenticada. "
+            + ("Escopo drive.file concedido para upload." if write else "Acesso somente leitura.")
+        )
     except (SQLAlchemyError, OSError, ValueError):
         fail(ctx, AppError("Falha no banco/configuração local; confira caminho e permissões."))
     except AppError as exc:
@@ -459,3 +478,137 @@ def solve(
 def solutions(ctx: typer.Context, assignment_local_id: int, offline: bool = False) -> None:
     """Lista versões e compara hash com contexto atual; nunca aprova/entrega."""
     phase4_command(ctx, assignment_local_id, "solutions", None, offline)
+
+
+@app.command()
+def solution(ctx: typer.Context, solution_id: int) -> None:
+    """Exibe uma solução versionada específica para revisão humana."""
+    try:
+        settings = load_settings()
+        engine = open_database(settings.database_file)
+        try:
+            with Session(engine) as session:
+                row = session.get(SolutionRecord, solution_id)
+                if row is None:
+                    raise AppError("Solução local não encontrada.")
+                console.print(
+                    Text(
+                        f"ID: {row.id}\nVersão: {row.version}\nAtividade: {row.assignment_id}\n"
+                        f"Provider/model: {row.provider}/{row.model}\nStatus: {row.status}\n"
+                        f"Context hash: {row.context_hash}\nCriada: {row.created_at}\n"
+                    )
+                )
+                if row.error:
+                    console.print(Text("Erro: " + row.error, style="red"))
+                if row.response:
+                    console.print_json(data=row.response)
+                elif row.answer:
+                    console.print(Text(row.answer))
+                else:
+                    console.print("Nenhuma resposta estruturada salva.")
+        finally:
+            engine.dispose()
+    except AppError as exc:
+        fail(ctx, exc)
+    except (SQLAlchemyError, OSError, ValueError):
+        fail(ctx, AppError("Falha segura ao ler a solução local."))
+
+
+@app.command()
+def generate(
+    ctx: typer.Context,
+    assignment_local_id: int,
+    template: str | None = typer.Option(None),
+    solution_version: int | None = typer.Option(None, "--solution-version"),
+    upload: bool = typer.Option(False, "--upload"),
+) -> None:
+    """Gera PDF versionado a partir de solução local revisável."""
+    try:
+        settings = load_settings()
+        engine = open_database(settings.database_file)
+        try:
+            artifact = DocumentBuilder(engine, settings).build(
+                assignment_local_id, solution_version, template
+            )
+            console.print(
+                f"Solução/template: {artifact.solution_id}/{artifact.template}; "
+                f"artifact v{artifact.version}"
+            )
+            console.print(f"PDF: {artifact.local_path}")
+            if upload:
+                uploaded = DriveUploader(
+                    engine,
+                    settings,
+                    DriveClient.from_credentials(
+                        authenticate(settings, require_write=True), settings
+                    ).service,
+                ).upload(artifact.id)
+                console.print(
+                    f"Upload: {uploaded.status}; link: {uploaded.drive_web_view_link or '—'}"
+                )
+        finally:
+            engine.dispose()
+    except AppError as exc:
+        fail(ctx, exc)
+    except (SQLAlchemyError, OSError, ValueError, TypeError):
+        fail(ctx, AppError("Falha segura ao gerar artifact."))
+
+
+@app.command()
+def artifacts(ctx: typer.Context, assignment_local_id: int) -> None:
+    """Lista PDFs gerados para uma atividade."""
+    try:
+        from app.persistence.models import GeneratedArtifact
+
+        engine = open_database(load_settings().database_file)
+        try:
+            with Session(engine) as s:
+                for a in s.scalars(
+                    select(GeneratedArtifact)
+                    .where(GeneratedArtifact.assignment_id == assignment_local_id)
+                    .order_by(GeneratedArtifact.version.desc())
+                ):
+                    console.print(
+                        f"#{a.id} v{a.version} {a.template} {a.status} "
+                        f"{a.local_path} {a.drive_web_view_link or ''}"
+                    )
+        finally:
+            engine.dispose()
+    except (SQLAlchemyError, OSError, ValueError):
+        fail(ctx, AppError("Falha segura ao listar artifacts."))
+
+
+@app.command()
+def upload(ctx: typer.Context, assignment_local_id: int) -> None:
+    """Envia o último PDF pendente para a pasta controlada do Drive."""
+    try:
+        settings = load_settings()
+        engine = open_database(settings.database_file)
+        try:
+            from app.persistence.models import GeneratedArtifact
+
+            with Session(engine) as s:
+                artifact = s.scalars(
+                    select(GeneratedArtifact)
+                    .where(GeneratedArtifact.assignment_id == assignment_local_id)
+                    .order_by(GeneratedArtifact.version.desc())
+                ).first()
+            if artifact is None:
+                raise AppError("Nenhum artifact gerado para esta atividade.")
+            drive = DriveClient.from_credentials(
+                authenticate(settings, require_write=True), settings
+            )
+            try:
+                result = DriveUploader(engine, settings, drive.service).upload(artifact.id)
+            finally:
+                drive.close()
+            console.print(
+                f"Pasta: {result.drive_folder_id}; arquivo: {Path(result.local_path).name}; "
+                f"status: {result.status}; link: {result.drive_web_view_link or '—'}"
+            )
+        finally:
+            engine.dispose()
+    except AppError as exc:
+        fail(ctx, exc)
+    except (SQLAlchemyError, OSError, ValueError, TypeError):
+        fail(ctx, AppError("Falha segura no upload."))

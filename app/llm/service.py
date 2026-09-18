@@ -9,6 +9,7 @@ from app.context.builder import context_hash
 from app.context.models import AssignmentContext
 from app.context.safety import sanitize
 from app.errors import AppError
+from app.llm.errors import MESSAGES, ProviderFailure
 from app.llm.prompt import SYSTEM_PROMPT, build_prompt
 from app.llm.providers import LLMProvider
 from app.llm.schema import Solution
@@ -32,8 +33,12 @@ def validate_solution(raw: str, context: AssignmentContext) -> Solution:
                 inspect_text(child)
 
     inspect_text(result.model_dump())
-    if not set(result.sources_used) <= set(context.provenance):
-        raise ValueError("Unknown sources")
+    unknown_sources = set(result.sources_used) - set(context.provenance)
+    if unknown_sources:
+        # Models sometimes paraphrase a provenance key. Never trust the paraphrase;
+        # discard it and keep the structured answer reviewable with an explicit warning.
+        result.sources_used = [s for s in result.sources_used if s in context.provenance]
+        result.warnings.append("Fontes citadas pelo modelo não reconhecidas foram descartadas.")
     questions = context.questions + [q for f in context.forms for q in f.questions]
     expected = {q.id for q in questions}
     supplied = [q.question_id for q in result.question_answers]
@@ -72,7 +77,7 @@ def solve_context(
                 context_hash=context_hash(context),
                 created_at=now,
                 updated_at=now,
-                request_metadata={"schema_version": 4, "prompt_version": 1, "attempts": 0},
+                request_metadata={"schema_version": 4, "prompt_version": 2, "attempts": 0},
             )
             session.add(row)
             session.flush()
@@ -88,6 +93,22 @@ def solve_context(
                 # Controlled regeneration: don't echo hostile invalid output or validation values.
                 system += (
                     "\nA tentativa anterior falhou na validação. Gere novamente seguindo o schema."
+                    " Use exatamente estas chaves obrigatórias: summary, assignment_types, "
+                    "understanding, answer, question_answers, artifacts, assumptions, "
+                    "uncertainties, sources_used, requires_user_input, warnings. "
+                    "Para uma atividade sem questões, use question_answers=[]; "
+                    "sources_used=[] é aceitável; não invente IDs. Retorne somente JSON."
+                )
+                valid_questions = [
+                    q.id for q in context.questions
+                ] + [q.id for form in context.forms for q in form.questions]
+                system += (
+                    "\nREGRAS EXATAS DE REPARO: question_answers só pode usar estes IDs: "
+                    + repr(valid_questions)
+                    + ". Se a lista estiver vazia, use question_answers=[] e responda em answer. "
+                    "sources_used só pode usar estas chaves de provenance: "
+                    + repr(sorted(context.provenance))
+                    + ". Não crie IDs, fontes ou perguntas alternativas."
                 )
             raw = provider.generate(system, build_prompt(context), Solution.model_json_schema())
             try:
@@ -95,23 +116,21 @@ def solve_context(
                 break
             except (ValidationError, ValueError):
                 if attempt:
-                    raise AppError(
-                        "Provider retornou resposta inválida após um reparo controlado."
-                    ) from None
+                    raise ProviderFailure("VALIDATION") from None
         if solution is None:
             raise AppError("Nenhuma solução válida.")
-    except Exception:
+    except Exception as exc:
+        code = exc.code if isinstance(exc, ProviderFailure) else "UNKNOWN"
+        message = MESSAGES.get(code, MESSAGES["UNKNOWN"])
         # Failure bodies and exception messages can contain keys or hostile content.
         with Session(engine) as session, session.begin():
             failed = session.get(SolutionRecord, row_id)
             assert failed is not None
             failed.status = "FAILED"
-            failed.error = "Falha segura de geração/validação; nenhuma resposta válida persistida."
+            failed.error = message
             failed.updated_at = datetime.now(UTC)
             failed.request_metadata = {**failed.request_metadata, "attempts": attempts}
-        raise AppError(
-            f"Solução #{row_id} FAILED: falha de geração/validação; consulte configuração."
-        ) from None
+        raise AppError(f"Solução #{row_id} FAILED: {message}") from None
     with Session(engine, expire_on_commit=False) as session, session.begin():
         saved = session.get(SolutionRecord, row_id)
         assert saved is not None

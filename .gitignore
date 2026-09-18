@@ -3,6 +3,12 @@
 credentials.json
 token.json
 
+# Dados/runtime
+data/
+*.db
+*.sqlite
+*.sqlite3
+
 # Python
 .venv/
 venv/
@@ -12,14 +18,17 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
-# Runtime / dados locais
-data/
-*.db
-*.sqlite
-*.sqlite3
-
 # IDE / OS
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
+
+token*.json
+credentials*.json
+.env
+.env.*
+!.env.example
+
+data/
+work/

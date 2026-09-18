@@ -8,7 +8,7 @@ version = "0.4.0"
 description = "Read-only Google Classroom foundation"
 requires-python = ">=3.11"
 dependencies = [
-  "pypdf>=6.19,<7", "defusedxml>=0.7,<1", "requests>=2.33,<3",
+  "pypdf>=6.19,<7", "reportlab>=4.2,<5", "defusedxml>=0.7,<1", "requests>=2.33,<3",
   "sqlalchemy>=2.0,<3",
   "google-api-python-client>=2.150,<3", "google-auth>=2.35,<3",
   "google-auth-oauthlib>=1.2,<2", "google-auth-httplib2>=0.2,<1",
@@ -42,6 +42,10 @@ disallow_untyped_calls = false
 
 [[tool.mypy.overrides]]
 module = ["google.*", "google_auth_oauthlib.*", "google_auth_httplib2.*", "googleapiclient.*", "httplib2.*", "oauthlib.*", "requests_oauthlib.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["reportlab.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

@@ -18,7 +18,7 @@ def open_database(path: Path) -> Engine:
     # Idempotent for this first schema. Refuse unknown future versions.
     with engine.begin() as connection:
         version = connection.exec_driver_sql("PRAGMA user_version").scalar_one()
-        if version not in (0, 1, 2, 3):
+        if version not in (0, 1, 2, 3, 4):
             raise ValueError("Unsupported database schema version")
         inspector = inspect(connection)
         existing = set(inspector.get_table_names())
@@ -29,6 +29,16 @@ def open_database(path: Path) -> Engine:
                 else set()
             )
             if table.name in existing and actual != set(table.columns.keys()):
+                if table.name == "generated_artifacts" and actual.issubset(
+                    set(table.columns.keys())
+                ):
+                    for column in table.columns:
+                        if column.name not in actual:
+                            connection.exec_driver_sql(
+                                f"ALTER TABLE generated_artifacts ADD COLUMN {column.name} "
+                                f"{column.type}"
+                            )
+                    continue
                 raise ValueError("Incompatible database schema; migration required")
         Base.metadata.create_all(connection)
         connection.exec_driver_sql("PRAGMA user_version=3")

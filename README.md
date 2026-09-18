@@ -7,6 +7,28 @@ versionadas para revisão humana. Não há turn-in, envio de Forms ou escrita no
 
 ## Fase 4
 
+### Gemini sem compra de créditos
+
+O provider `gemini` usa a Gemini Developer API (`generateContent`) com JSON,
+sem ferramentas. Crie uma chave em https://aistudio.google.com/apikey num projeto
+**Free Tier**, sem habilitar faturamento. A faixa gratuita tem limites; uma chave
+de projeto pago segue o faturamento desse projeto. O código não verifica nem altera
+o plano. Na faixa gratuita, conteúdo pode ser usado pelo Google para melhorar produtos.
+
+No arquivo **`.env`**, e não em `.env.example`, configure:
+
+```dotenv
+LLM_PROVIDER=gemini
+GEMINI_API_KEY=sua-chave-do-google-ai-studio
+GEMINI_MODEL=gemini-3.8-flash
+GEMINI_TIMEOUT_SECONDS=120
+```
+
+Execute `python main.py solve 8 --provider gemini`. A validação, o versionamento,
+o reparo limitado e a revisão humana são os mesmos. Não há fallback para API paga.
+Documentação: https://ai.google.dev/gemini-api/docs/pricing e
+https://ai.google.dev/api/generate-content .
+
 ```powershell
 python main.py context <id>
 python main.py context <id> --json
@@ -295,3 +317,6 @@ Referências oficiais:
 [scopes Drive](https://developers.google.com/workspace/drive/api/guides/api-specific-auth).
 
 Próxima fase: Fase 4 — Context Builder + Astra/LLM + resolução estruturada
+# Fase 5 — PDF e Drive
+
+Consulte [IMPLEMENTATION_REPORT_FASE5.md](IMPLEMENTATION_REPORT_FASE5.md) para os comandos `generate`, `artifacts` e `upload`, configuração de identidade, OAuth `drive.file` e procedimento de validação.

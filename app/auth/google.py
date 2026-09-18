@@ -11,7 +11,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from oauthlib.oauth2 import OAuth2Error
 
-from app.config import SCOPES, Settings
+from app.config import SCOPES, WRITE_SCOPES, Settings
 from app.errors import AppError, ReauthenticationRequired
 
 Diagnostic = Callable[[str], None]
@@ -84,7 +84,13 @@ def validate_credentials(
     return granted
 
 
-def recover_scope_change(flow: Any, warning: Warning, diagnostic: Diagnostic | None) -> Any:
+def recover_scope_change(
+    flow: Any,
+    warning: Warning,
+    diagnostic: Diagnostic | None,
+    expected_scopes: tuple[str, ...] = SCOPES,
+    require_write: bool = False,
+) -> Any:
     """Recover only OAuthLib's validated scope-change token, never arbitrary warnings.
 
     OAuthLib 3.x validates state and token errors before raising this Warning;
@@ -96,9 +102,13 @@ def recover_scope_change(flow: Any, warning: Warning, diagnostic: Diagnostic | N
     new = getattr(warning, "new_scope", None)
     if not isinstance(token, dict) or not token.get("access_token") or old is None or new is None:
         raise AppError("Aviso inesperado durante OAuth; nenhum token foi salvo.") from warning
-    if normalize_scopes(old) != frozenset(SCOPES):
+    if normalize_scopes(old) != frozenset(expected_scopes):
         raise AppError("Scopes solicitados inesperados no fluxo OAuth.") from warning
     actual = require_scopes(token.get("scope"), diagnostic)
+    if require_write and WRITE_SCOPES[0] not in actual:
+        raise ReauthenticationRequired(
+            "O Google não concedeu o escopo drive.file; execute auth --write novamente."
+        )
     if actual != normalize_scopes(new):
         raise AppError("Scopes inconsistentes na resposta OAuth.") from warning
     # Use the public token setter; the access token/code is never printed or retried.
@@ -132,19 +142,29 @@ def save_token(
 
 
 def authenticate(
-    settings: Settings, *, interactive: bool = False, diagnostic: Diagnostic | None = None
+    settings: Settings,
+    *,
+    interactive: bool = False,
+    diagnostic: Diagnostic | None = None,
+    require_write: bool = False,
 ) -> Any:
     """Only `auth` opens a browser; read commands refresh cached credentials silently."""
     try:
         if diagnostic:
             diagnostic("scopes requeridos: " + json.dumps(list(SCOPES)))
+        requested_scopes = (*SCOPES, *WRITE_SCOPES) if require_write else SCOPES
         if settings.token_file.exists():
             payload = json.loads(settings.token_file.read_text(encoding="utf-8"))
             cached_grant = require_scopes(
                 payload.get("granted_scopes", payload.get("scopes")), diagnostic
             )
+            if require_write and WRITE_SCOPES[0] not in cached_grant:
+                raise ReauthenticationRequired(
+                    "Scope drive.file ausente; renomeie GOOGLE_TOKEN_FILE e execute "
+                    "python main.py auth --write."
+                )
             # Google ships this factory without a typed signature.
-            credentials = Credentials.from_authorized_user_info(payload, scopes=SCOPES)  # type: ignore[no-untyped-call]
+            credentials = Credentials.from_authorized_user_info(payload, scopes=requested_scopes)  # type: ignore[no-untyped-call]
             if credentials.valid:
                 validate_credentials(credentials, diagnostic, cached_grant)
                 return credentials
@@ -161,7 +181,7 @@ def authenticate(
         config = json.loads(settings.credentials_file.read_text(encoding="utf-8"))
         if "installed" not in config:
             raise AppError("As credenciais devem ser do tipo OAuth Desktop App.")
-        flow = InstalledAppFlow.from_client_config(config, scopes=SCOPES)
+        flow = InstalledAppFlow.from_client_config(config, scopes=requested_scopes)
         try:
             credentials = flow.run_local_server(
                 host="localhost",
@@ -175,7 +195,9 @@ def authenticate(
                 include_granted_scopes="false",
             )
         except Warning as warning:
-            credentials = recover_scope_change(flow, warning, diagnostic)
+            credentials = recover_scope_change(
+                flow, warning, diagnostic, requested_scopes, require_write
+            )
         granted = validate_credentials(credentials, diagnostic)
         save_token(credentials, settings.token_file, granted_scopes=granted)
         return credentials

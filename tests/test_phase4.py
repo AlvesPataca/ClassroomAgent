@@ -427,6 +427,7 @@ def test_astra_documented_transport(phase4):
         assert validate_solution(raw, ctx)
         request = post.call_args.kwargs
         assert request["json"]["tools"] == [] and request["json"]["store"] is False
+        assert request["json"]["model"] == "gpt-5-mini"
         assert request["json"]["text"]["format"]["strict"] is True
         assert "SECRET" not in json.dumps(request["json"])
         assert request["allow_redirects"] is False

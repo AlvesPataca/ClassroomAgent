@@ -56,7 +56,8 @@ def sufficient(text: str) -> bool:
     return bool(
         re.search(
             r"(?i)\b(?:explique|compare|descreva|calcule|resolva|implemente|escreva|elabore|"
-            r"analise|demonstre|justifique|defina|pesquise|crie|realizar|realize|produza|"
+            r"analise|demonstre|justifique|defina|pesquise|crie|construa|construir|"
+            r"realizar|realize|produza|"
             r"investigue|pesquisa|explain|compare|calculate|implement|write|describe|solve)"
             r"\b\s+\S.{2,}|\S.{4,}\?",
             text,

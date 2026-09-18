@@ -112,9 +112,7 @@ class SolutionRecord(Base):
     __table_args__ = (
         UniqueConstraint("assignment_id", "version"),
         CheckConstraint("version > 0"),
-        CheckConstraint(
-            "status IN ('GENERATING', 'READY', 'NEEDS_REVIEW', 'FAILED', 'APPROVED')"
-        ),
+        CheckConstraint("status IN ('GENERATING', 'READY', 'NEEDS_REVIEW', 'FAILED', 'APPROVED')"),
     )
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     assignment_id: Mapped[int] = mapped_column(ForeignKey("assignments.id"), index=True)
@@ -129,3 +127,27 @@ class SolutionRecord(Base):
     error: Mapped[str | None] = mapped_column(String)
     created_at: Mapped[datetime] = mapped_column(AwareTimestamp(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(AwareTimestamp(), nullable=False)
+
+
+class GeneratedArtifact(Base):
+    __tablename__ = "generated_artifacts"
+    __table_args__ = (
+        UniqueConstraint("assignment_id", "version"),
+        CheckConstraint("status IN ('GENERATING','READY','UPLOAD_PENDING','UPLOADED','FAILED')"),
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    solution_id: Mapped[int] = mapped_column(ForeignKey("solutions.id"), index=True)
+    assignment_id: Mapped[int] = mapped_column(ForeignKey("assignments.id"), index=True)
+    artifact_type: Mapped[str] = mapped_column(String, default="PDF")
+    template: Mapped[str] = mapped_column(String, nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    local_path: Mapped[str] = mapped_column(String, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    drive_file_id: Mapped[str | None] = mapped_column(String)
+    drive_folder_id: Mapped[str | None] = mapped_column(String)
+    drive_web_view_link: Mapped[str | None] = mapped_column(String)
+    error: Mapped[str | None] = mapped_column(String)
+    created_at: Mapped[datetime] = mapped_column(AwareTimestamp(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(AwareTimestamp(), nullable=False)
+    uploaded_at: Mapped[datetime | None] = mapped_column(AwareTimestamp())

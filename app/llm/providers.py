@@ -6,6 +6,7 @@ import requests
 
 from app.config import Settings
 from app.errors import AppError
+from app.llm.errors import ProviderFailure
 from app.llm.schema import Solution
 
 
@@ -49,8 +50,8 @@ class AstraProvider(LLMProvider):
             raise AppError(
                 "ASTRA_BASE_URL deve ser https://api.openai.com/v1 (protocolo documentado)."
             )
-        if settings.astra_model != "gpt-6-astra":
-            raise AppError("ASTRA_MODEL suportado nesta fase: gpt-6-astra.")
+        if settings.astra_model not in {"gpt-6-astra", "gpt-5-mini"}:
+            raise AppError("ASTRA_MODEL suportado: gpt-5-mini ou gpt-6-astra.")
         if not settings.astra_api_key.get_secret_value():
             raise AppError(
                 "Configure ASTRA_API_KEY no .env; acesso do Work não autentica a API local."
@@ -86,9 +87,29 @@ class AstraProvider(LLMProvider):
                 stream=True,
             ) as response:
                 if response.status_code != 200:
-                    raise AppError(
-                        "Astra: requisição recusada/indisponível. Confira chave, acesso e quota."
-                    )
+                    status = response.status_code
+                    code = {
+                        400: "REQUEST",
+                        401: "AUTH",
+                        403: "ACCESS",
+                        404: "ACCESS",
+                        429: "RATE",
+                    }.get(status, "SERVER")
+                    error_body = bytearray()
+                    for chunk in response.iter_content(4096):
+                        error_body.extend(chunk)
+                        if len(error_body) > 65536:
+                            break
+                    if len(error_body) <= 65536:
+                        try:
+                            remote = json.loads(error_body).get("error", {}).get("code")
+                            if remote in {"insufficient_quota", "billing_hard_limit_reached"}:
+                                code = "QUOTA"
+                            elif remote == "invalid_json_schema":
+                                code = "SCHEMA"
+                        except (ValueError, AttributeError, TypeError):
+                            pass
+                    raise ProviderFailure(code)
                 body = bytearray()
                 for chunk in response.iter_content(65536):
                     body.extend(chunk)
@@ -96,7 +117,7 @@ class AstraProvider(LLMProvider):
                         raise AppError("Astra: resposta excede limite seguro.")
                 result = json.loads(body)
             if result.get("status") != "completed":
-                raise AppError("Astra: resposta incompleta; nenhuma solução pronta foi salva.")
+                raise ProviderFailure("INCOMPLETE")
             output: list[str] = []
             for item in result.get("output", []):
                 if item.get("type") == "reasoning":
@@ -110,10 +131,12 @@ class AstraProvider(LLMProvider):
             if len(output) != 1:
                 raise AppError("Astra: resposta estruturada ausente ou ambígua.")
             return output[0]
-        except (requests.RequestException, ValueError, TypeError, KeyError, AttributeError) as exc:
-            raise AppError(
-                "Astra: falha de transporte/protocolo; tente novamente manualmente."
-            ) from exc
+        except requests.Timeout:
+            raise ProviderFailure("TIMEOUT") from None
+        except requests.RequestException:
+            raise ProviderFailure("NETWORK") from None
+        except (ValueError, TypeError, KeyError, AttributeError):
+            raise ProviderFailure("PROTOCOL") from None
 
 
 def get_provider(settings: Settings, override: str | None = None) -> LLMProvider:
@@ -122,4 +145,8 @@ def get_provider(settings: Settings, override: str | None = None) -> LLMProvider
         return MockProvider()
     if name == "astra":
         return AstraProvider(settings)
-    raise AppError("LLM_PROVIDER desconhecido. Use mock ou astra.")
+    if name == "gemini":
+        from app.llm.gemini import GeminiProvider
+
+        return GeminiProvider(settings)
+    raise AppError("LLM_PROVIDER desconhecido. Use mock, astra ou gemini.")
