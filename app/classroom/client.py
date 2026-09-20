@@ -11,9 +11,15 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from pydantic import ValidationError
 
-from app.classroom.mapper import map_assignment, map_course, map_submission
+from app.classroom.mapper import (
+    map_assignment,
+    map_course,
+    map_course_resource,
+    map_submission,
+    map_topic,
+)
 from app.config import Settings
-from app.domain.models import Assignment, Course, Submission
+from app.domain.models import Assignment, Course, CourseResource, Submission, Topic
 from app.errors import AppError
 
 T = TypeVar("T")
@@ -146,4 +152,72 @@ class ClassroomClient:
                 userId="me",
             ),
             map_submission,
+        )
+
+    def list_course_resources(self, course_id: str) -> list[CourseResource]:
+        materials = self._mapped(
+            self._pages(
+                self._service.courses().courseWorkMaterials(),
+                "courseWorkMaterial",
+                courseId=course_id,
+                courseWorkMaterialStates=["PUBLISHED"],
+            ),
+            lambda raw: map_course_resource(raw, "COURSE_MATERIAL"),
+        )
+        announcements = self._mapped(
+            self._pages(
+                self._service.courses().announcements(),
+                "announcements",
+                courseId=course_id,
+                announcementStates=["PUBLISHED"],
+            ),
+            lambda raw: map_course_resource(raw, "ANNOUNCEMENT"),
+        )
+        return [*materials, *announcements]
+
+    def list_topics(self, course_id: str) -> list[Topic]:
+        return self._mapped(
+            self._pages(self._service.courses().topics(), "topic", courseId=course_id),
+            lambda raw: map_topic(raw, course_id),
+        )
+
+    def submission_material_ids(
+        self, course_id: str, coursework_id: str, submission_id: str
+    ) -> set[str]:
+        """Read the student's draft attachments without turning the work in."""
+        payload = self._execute(
+            self._service.courses()
+            .courseWork()
+            .studentSubmissions()
+            .get(courseId=course_id, courseWorkId=coursework_id, id=submission_id)
+        )
+        materials = payload.get("assignmentSubmission", {}).get("attachments", [])
+        return {
+            str(item["driveFile"]["id"])
+            for item in materials
+            if isinstance(item, dict)
+            and isinstance(item.get("driveFile"), dict)
+            and item["driveFile"].get("id")
+        }
+
+    def attach_drive_files(
+        self,
+        course_id: str,
+        coursework_id: str,
+        submission_id: str,
+        drive_file_ids: list[str],
+    ) -> None:
+        """Attach Drive files to the draft submission; never calls turnIn."""
+        if not drive_file_ids:
+            return
+        self._execute(
+            self._service.courses()
+            .courseWork()
+            .studentSubmissions()
+            .modifyAttachments(
+                courseId=course_id,
+                courseWorkId=coursework_id,
+                id=submission_id,
+                body={"addAttachments": [{"driveFile": {"id": value}} for value in drive_file_ids]},
+            )
         )

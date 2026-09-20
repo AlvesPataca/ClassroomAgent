@@ -114,7 +114,8 @@ def test_atomic_token_write_failure_preserves_original(tmp_path):
     ],
 )
 def test_cli_help(command):
-    result = CliRunner().invoke(app, command or ["--help"])
+    with patch("app.cli.commands._run_automation"):
+        result = CliRunner().invoke(app, command or [])
     assert result.exit_code == 0
 
 

@@ -66,6 +66,60 @@ def test_description_only_no_attachment(phase4):
     assert AssignmentContext.model_validate_json(ctx.model_dump_json()) == ctx
 
 
+def test_course_slide_is_associated_by_topic_and_enters_context(phase4):
+    settings, engine, source = phase4
+    from app.domain.models import CourseResource, Topic
+
+    source.assignments[0].topic_id = "topic-1"
+    source.assignments[0].raw_payload["topicId"] = "topic-1"
+    source.topics = [Topic(google_id="topic-1", course_id="c", name="Banco de dados")]
+    source.resources = [
+        CourseResource(
+            google_id="material-1",
+            course_id="c",
+            kind="COURSE_MATERIAL",
+            title="Aula 07 - Normalização",
+            description="Slides de apoio sobre normalização de banco de dados.",
+            topic_id="topic-1",
+            materials=[drive_material("normalizacao.pptx", "slide_123")],
+        )
+    ]
+    assert synchronize(engine, lambda: source).status == "SUCCESS"
+    context = build_assignment_context(engine, 1, settings, read_forms=False)
+    assert context.related_materials[0].title.text == "Aula 07 - Normalização"
+    assert context.related_materials[0].score >= 60
+    assert "mesmo tópico" in " ".join(context.related_materials[0].reasons)
+    rows = AttachmentService(engine, settings).list(1)
+    assert rows[0]["drive_id"] == "slide_123" and rows[0]["present"]
+
+
+def test_slide_url_pasted_in_announcement_becomes_attachment(phase4):
+    settings, engine, source = phase4
+    from app.domain.models import CourseResource
+
+    source.resources = [
+        CourseResource(
+            google_id="announcement-1",
+            course_id="c",
+            kind="ANNOUNCEMENT",
+            title=(
+                "Material de apoio: "
+                "https://docs.google.com/presentation/d/slide_456/edit?usp=sharing"
+            ),
+            description=(
+                "Slides: https://docs.google.com/presentation/d/slide_456/edit?usp=sharing"
+            ),
+            creation_time=source.assignments[0].creation_time,
+        )
+    ]
+    source.assignments[0].description = "Realize a atividade usando o material de apoio publicado."
+    assert synchronize(engine, lambda: source).status == "SUCCESS"
+    rows = AttachmentService(engine, settings).list(1)
+    assert rows[0]["drive_id"] == "slide_456"
+    assert rows[0]["title"] == "Material de apoio"
+    assert build_assignment_context(engine, 1, settings, read_forms=False).related_materials
+
+
 @pytest.mark.parametrize(
     "text",
     ["", "Original", "Leia com atenção.", "Responda o formulário abaixo: https://forms.gle/abc"],
@@ -86,6 +140,12 @@ def test_insufficient_uncertain(phase4, text):
 )
 def test_sufficient_description(text):
     assert sufficient(text)
+
+
+def test_substantive_noun_phrase_description_is_accepted():
+    assert sufficient("Trabalho sobre o conteúdo apresentado na aula de redes.")
+    assert not sufficient("Leia com atenção.")
+    assert not sufficient("Realize a atividade referente aos slides de normalização.")
 
 
 @pytest.mark.parametrize(

@@ -1,12 +1,12 @@
 # Classroom Agent
 
-Agente local em Python para consultar o Google Classroom como aluno, sincronizar dados para SQLite, descobrir contexto de atividades, preparar soluções estruturadas com LLM, gerar PDFs revisáveis e, na Fase 5, enviar esses PDFs para uma pasta controlada do Google Drive.
+Agente local em Python para consultar o Google Classroom como aluno, sincronizar dados para SQLite, descobrir contexto de atividades, preparar soluções estruturadas com LLM, gerar PDFs revisáveis e os arquivos pedidos pela tarefa, e enviá-los para uma pasta controlada do Google Drive.
 
 ## Visão geral e fluxo
 
-`Google Classroom → sync/persistência SQLite → context discovery → LLM/solução estruturada → DocumentBuilder → PDF → Google Drive`
+`Google Classroom → sync/persistência SQLite → contexto → solução → PDF + arquivos solicitados → revisão local → (upload explícito) Google Drive`
 
-O Classroom fornece cursos, atividades, submissões e referências a materiais. `sync` mantém um snapshot local; a descoberta de contexto reúne descrição, links, Forms e anexos extraídos com provenance, limites e sanitização; `solve` grava uma resposta estruturada versionada; `generate` escolhe um template e cria um PDF; `upload` envia somente esse PDF para a pasta de respostas configurada.
+O Classroom fornece cursos, atividades, submissões e referências a materiais. `sync` mantém um snapshot local e também coleta materiais, comunicados e tópicos da turma. A descoberta de contexto reúne a descrição, associa materiais por tópico, texto e proximidade de publicação, além de links, Forms e anexos extraídos com provenance, limites e sanitização. `solve` grava uma resposta estruturada versionada; `generate` cria o PDF de revisão e materializa arquivos textuais pedidos, como HTML, CSS, JavaScript, Python, SQL, Markdown e CSV; `upload` envia os artefatos pendentes para a pasta de respostas configurada.
 
 ## Funcionalidades por fase
 
@@ -15,10 +15,11 @@ O Classroom fornece cursos, atividades, submissões e referências a materiais. 
 - **Fase 3:** descoberta, download seguro e extração local de anexos suportados, com limites de tamanho, hash, estados, histórico e proteção contra conteúdo não confiável.
 - **Fase 4:** descoberta de contexto canônico para atividades, leitura opcional de Google Forms, provenance, orçamento de contexto, soluções estruturadas validadas por schema, providers `mock`, Gemini e Astra/OpenAI-compatible, versionamento e comparação por hash.
 - **Fase 5:** `DocumentBuilder` com PDFs versionados, templates `QUESTION_ANSWER`, `ACADEMIC_REPORT` e `CODE_ASSIGNMENT`, persistência de artifacts, organização no Drive por disciplina e upload explícito com scope mínimo `drive.file`.
+- **Fase 6:** fluxo contínuo opcional, com sincronização imediata e verificações a cada 8 horas, seleção de atividades na segunda metade do prazo, solução e geração idempotentes, anexos no rascunho da submissão e sem `turnIn` automático.
 
 ## Arquitetura
 
-`app/classroom` acessa a API do Classroom; `app/sync.py` coordena a sincronização; `app/persistence` define banco, modelos e leitor local; `app/attachments` descobre, baixa e extrai materiais; `app/context` monta o contexto seguro; `app/llm` chama o provider e valida a solução; `app/documents` renderiza e envia PDFs; `app/cli` expõe a interface Typer.
+`app/classroom` acessa a API do Classroom; `app/sync.py` coordena a sincronização; `app/automation.py` executa o fluxo contínuo; `app/persistence` define banco, modelos e leitor local; `app/attachments` descobre, baixa e extrai materiais; `app/context` monta o contexto seguro; `app/llm` chama o provider e valida a solução; `app/documents` renderiza e envia artifacts; `app/cli` expõe a interface Typer.
 
 ## Stack
 
@@ -69,25 +70,32 @@ Copie `.env.example` para `.env`. As variáveis principais são:
 | `TIMEZONE` | Fuso usado para exibir prazos. |
 | `GENERATED_ROOT` | Raiz dos PDFs gerados. |
 | `LLM_PROVIDER` | Provider configurado; `mock` é seguro para testes locais. |
-| `GEMINI_API_KEY`, `GEMINI_MODEL` | Credencial e modelo Gemini, quando usado. |
+| `GEMINI_API_KEY`, `GEMINI_MODEL`, `GEMINI_FALLBACK_MODEL` | Credencial, modelo principal e fallback Gemini para erros 503 persistentes. |
 | `ASTRA_API_KEY`, `ASTRA_BASE_URL`, `ASTRA_MODEL` | Provider compatível com API OpenAI, quando usado. |
 | `CONTEXT_MAX_CHARS` | Limite do contexto montado. |
 | `DRIVE_RESPONSES_FOLDER_ID` | ID da pasta raiz controlada para respostas; vazio cria/encontra `DRIVE_RESPONSES_FOLDER_NAME`. |
 | `DRIVE_RESPONSES_FOLDER_NAME` | Nome usado quando o ID não é informado. |
 | `DRIVE_ORGANIZE_BY_COURSE` | Quando `true`, cria uma subpasta por disciplina. |
+| `AUTOMATION_INTERVAL_HOURS` | Intervalo entre ciclos contínuos; padrão `8` horas. |
+| `LOG_FILE` | Arquivo de log rotativo; padrão `logs/classroom-agent.log`. |
+| `LOG_LEVEL` | Nível do log (`DEBUG`, `INFO`, `WARNING`, `ERROR`); padrão `INFO`. |
+| `LOG_MAX_BYTES`, `LOG_BACKUP_COUNT` | Tamanho máximo e quantidade de arquivos de log rotacionados. |
 
 Não coloque secrets no `.env.example`; use valores locais somente no `.env`.
 
 ## Google Cloud, OAuth e scopes
 
-Habilite as APIs necessárias e crie credenciais OAuth Desktop. O fluxo de leitura solicita apenas:
+Habilite as APIs necessárias e crie credenciais OAuth Desktop. O fluxo de leitura solicita apenas scopes somente leitura:
 
 - `classroom.courses.readonly`;
 - `classroom.coursework.me.readonly`;
 - `classroom.student-submissions.me.readonly`;
+- `classroom.courseworkmaterials.readonly`;
+- `classroom.announcements.readonly`;
+- `classroom.topics.readonly`;
 - `drive.readonly`.
 
-Para a Fase 5, o upload solicita adicionalmente somente `drive.file`, que permite criar e gerenciar os arquivos criados pelo agente. Execute `python main.py auth --write` quando precisar conceder esse scope. Se os scopes mudarem, renomeie ou remova apenas o arquivo indicado por `GOOGLE_TOKEN_FILE` e reautentique; não remova `credentials.json`.
+Para geração e upload manual, `auth --write` solicita `drive.file` e `classroom.coursework.me`. O segundo permite anexar arquivos à própria submissão do aluno; ele não permite executar `turnIn`. Execute `python main.py auth --write` depois desta alteração. Se os scopes mudarem, renomeie ou remova apenas o arquivo indicado por `GOOGLE_TOKEN_FILE` e reautentique; não remova `credentials.json`.
 
 ## Autenticação
 
@@ -103,6 +111,7 @@ O primeiro comando abre o navegador para os scopes de leitura. O segundo inclui 
 Consulte sempre a ajuda instalada com `python main.py --help`. Os comandos atualmente disponíveis são:
 
 ```text
+run [--once]
 auth [--write]
 sync
 courses [--include-archived] [--api]
@@ -126,6 +135,7 @@ upload ASSIGNMENT_LOCAL_ID
 ### Fluxo completo
 
 ```powershell
+python main.py run --once
 python main.py auth
 python main.py sync
 python main.py local-assignments
@@ -141,7 +151,37 @@ python main.py auth --write
 python main.py upload 12
 ```
 
+Sem subcomando, `python main.py` inicia o fluxo contínuo. Ele sincroniza a conta
+imediatamente e repete a verificação a cada 8 horas (`AUTOMATION_INTERVAL_HOURS`).
+Atividades publicadas, pendentes, com prazo definido e já na metade do intervalo entre
+publicação e vencimento são preparadas automaticamente: anexos são baixados e extraídos,
+o contexto é enviado ao provider configurado, a solução é salva para revisão, o PDF e
+os arquivos pedidos são gerados, enviados ao Drive e anexados ao rascunho da submissão.
+O fluxo nunca chama `turnIn`; a revisão e o envio final permanecem manuais. Use `run --once`
+para testar uma rodada e `Ctrl+C` para encerrar o processo.
+
 Substitua `12` pelo ID local mostrado no seu banco. O provider `mock` não chama serviço externo e é útil para verificar o fluxo.
+
+### Fluxo contínuo
+
+```powershell
+# Uma rodada imediata, sem esperar o intervalo
+python main.py run --once
+
+# Processo contínuo: primeira rodada imediata e depois a cada 8 horas
+python main.py
+```
+
+O fluxo contínuo considera apenas atividades publicadas, pendentes, com publicação e prazo
+definidos, ainda não vencidas e cujo horário atual já alcançou a metade do intervalo entre
+publicação e vencimento. Ele baixa e extrai materiais, monta o contexto, chama o provider,
+salva a solução para revisão, gera os arquivos, envia-os ao Drive e anexa-os ao rascunho.
+Não faz `turnIn` no Classroom. A execução é idempotente para o mesmo hash de contexto; mudanças no
+enunciado ou nos materiais criam uma nova versão.
+
+Os eventos aparecem no console e são gravados em `LOG_FILE`. O arquivo usa rotação automática;
+por padrão, cada arquivo tem até 10 MB e são mantidas cinco cópias anteriores. Em um servidor
+Oracle Cloud, aponte `LOG_FILE` para um volume persistente se necessário.
 
 ## Templates PDF
 
@@ -153,7 +193,7 @@ O template pode ser escolhido com `--template`; sem override, o builder escolhe 
 
 ## Drive e organização por disciplina
 
-Defina `DRIVE_RESPONSES_FOLDER_ID` com o ID da pasta raiz. Com `DRIVE_ORGANIZE_BY_COURSE=true`, o agente cria ou reutiliza uma subpasta com o nome da disciplina e envia o PDF nela. Se o ID ficar vazio, o agente procura ou cria a pasta definida em `DRIVE_RESPONSES_FOLDER_NAME`. O upload é explícito e só aceita PDFs gerados dentro de `GENERATED_ROOT`.
+Defina `DRIVE_RESPONSES_FOLDER_ID` com o ID da pasta raiz. Com `DRIVE_ORGANIZE_BY_COURSE=true`, o agente cria ou reutiliza uma subpasta com o nome da disciplina e envia os arquivos nela. Se o ID ficar vazio, o agente procura ou cria a pasta definida em `DRIVE_RESPONSES_FOLDER_NAME`. O upload é explícito e aceita apenas extensões textuais permitidas e PDFs gerados dentro de `GENERATED_ROOT`.
 
 ## Persistência e estrutura
 
@@ -177,7 +217,7 @@ Nunca versione `.env`, `credentials*.json`, `token*.json`, `data/` ou arquivos p
 ## Troubleshooting
 
 - **OAuth/scopes:** remova ou renomeie o token definido em `GOOGLE_TOKEN_FILE` e execute `python main.py auth` ou `python main.py auth --write` conforme o erro. Confira se a credencial é Desktop app.
-- **Drive API/upload:** habilite a Drive API, conceda `drive.file`, valide `DRIVE_RESPONSES_FOLDER_ID` e confira se o PDF está em `GENERATED_ROOT`.
+- **Drive API/upload:** habilite a Drive API, execute `auth --write`, valide `DRIVE_RESPONSES_FOLDER_ID` e confira os artifacts em `GENERATED_ROOT`. O upload explícito envia o PDF e os arquivos textuais pendentes.
 - **Contexto sem anexos:** rode `sync`, confira `local-assignments` e depois `attachments`, `fetch-attachments` e `extract`. Materiais removidos ou não suportados permanecem registrados com estado.
 - **Forms não acessível:** use `context ID --offline` para montar o contexto sem leitura da API de Forms; verifique API habilitada e permissões quando a leitura oficial for necessária.
 - **Banco/configuração:** confira caminhos relativos ao diretório do projeto, permissões de escrita em `data/` e o timezone configurado.
@@ -194,7 +234,7 @@ Esses comandos verificam lint, tipos e a suíte presente no repositório. O READ
 
 ## Limitações atuais
 
-Não há turn-in automático no Classroom, envio automático de respostas para Google Forms nem browser automation. O upload envia somente o PDF gerado para o Drive; revisão e decisão de entrega continuam manuais.
+Não há `turnIn` automático no Classroom, envio automático de respostas para Google Forms nem browser automation. O fluxo contínuo anexa os arquivos ao rascunho para revisão; a decisão de entrega continua manual.
 
 ## Próxima fase
 

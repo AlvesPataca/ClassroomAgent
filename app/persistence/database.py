@@ -18,7 +18,7 @@ def open_database(path: Path) -> Engine:
     # Idempotent for this first schema. Refuse unknown future versions.
     with engine.begin() as connection:
         version = connection.exec_driver_sql("PRAGMA user_version").scalar_one()
-        if version not in (0, 1, 2, 3, 4):
+        if version not in (0, 1, 2, 3, 4, 5):
             raise ValueError("Unsupported database schema version")
         inspector = inspect(connection)
         existing = set(inspector.get_table_names())
@@ -41,5 +41,5 @@ def open_database(path: Path) -> Engine:
                     continue
                 raise ValueError("Incompatible database schema; migration required")
         Base.metadata.create_all(connection)
-        connection.exec_driver_sql("PRAGMA user_version=3")
+        connection.exec_driver_sql("PRAGMA user_version=5")
     return engine

@@ -107,6 +107,28 @@ def test_real_discovery_schema_without_network():
     assert "classroom.googleapis.com" in request.uri
 
 
+def test_course_resources_and_topics_use_official_endpoints():
+    service = MagicMock()
+    courses = service.courses.return_value
+    courses.courseWorkMaterials.return_value.list.return_value.execute.return_value = {
+        "courseWorkMaterial": [
+            {"id": "m", "courseId": "c", "title": "Slides", "materials": []}
+        ]
+    }
+    courses.announcements.return_value.list.return_value.execute.return_value = {
+        "announcements": [{"id": "n", "courseId": "c", "text": "Aviso"}]
+    }
+    courses.topics.return_value.list.return_value.execute.return_value = {
+        "topic": [{"topicId": "t", "name": "Redes"}]
+    }
+    client = ClassroomClient(service, Settings())
+    assert [row.google_id for row in client.list_course_resources("c")] == ["m", "n"]
+    assert client.list_topics("c")[0].name == "Redes"
+    assert courses.courseWorkMaterials.return_value.list.call_args.kwargs[
+        "courseWorkMaterialStates"
+    ] == ["PUBLISHED"]
+
+
 @pytest.mark.parametrize(
     "field,reason,expected",
     [

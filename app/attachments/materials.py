@@ -67,8 +67,22 @@ def parse_materials(materials: object) -> list[dict[str, Any]]:
         url = safe_url(item.get("alternateLink") or item.get("url") or item.get("formUrl"))
         title = plain(item.get("title") or item.get("name")) or "Sem título"
         identity = kind + ":" + (drive_id or identifier or url or f"slot-{index}")
-        sanitized = dict(kind=kind, title=title, drive_id=drive_id, url=url)
-        rows[identity] = dict(identity_key=identity, **sanitized, raw_payload=sanitized)
+        sanitized: dict[str, Any] = dict(kind=kind, title=title, drive_id=drive_id, url=url)
+        stored_payload: dict[str, Any] = dict(sanitized)
+        association = raw.get("_classroom_agent")
+        if isinstance(association, dict):
+            stored_payload["association"] = {
+                "resource_id": association.get("resource_id")
+                if isinstance(association.get("resource_id"), int)
+                else None,
+                "resource_kind": plain(association.get("resource_kind"), 32),
+                "resource_title": plain(association.get("resource_title"), 512),
+                "score": max(0, min(100, int(association.get("score", 0)))),
+                "reasons": [plain(reason, 256) for reason in association.get("reasons", [])[:10]]
+                if isinstance(association.get("reasons"), list)
+                else [],
+            }
+        rows[identity] = dict(identity_key=identity, **sanitized, raw_payload=stored_payload)
     return list(rows.values())
 
 

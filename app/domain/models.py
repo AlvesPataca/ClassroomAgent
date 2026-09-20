@@ -35,6 +35,7 @@ class Assignment(DomainModel):
     alternate_link: str | None = None
     work_type: str = "COURSE_WORK_TYPE_UNSPECIFIED"
     max_points: float | None = None
+    topic_id: str | None = None
     state: str = "COURSE_WORK_STATE_UNSPECIFIED"
     raw_payload: dict[str, Any] = Field(default_factory=dict, repr=False)
 
@@ -59,3 +60,24 @@ class Submission(DomainModel):
     creation_time: AwareDatetime | None = None
     update_time: AwareDatetime | None = None
     raw_payload: dict[str, Any] = Field(default_factory=dict, repr=False)
+
+
+class CourseResource(DomainModel):
+    google_id: str
+    course_id: str
+    kind: str
+    title: str
+    description: str | None = None
+    topic_id: str | None = None
+    materials: list[dict[str, Any]] = Field(default_factory=list)
+    creation_time: AwareDatetime | None = None
+    update_time: AwareDatetime | None = None
+    alternate_link: str | None = None
+    raw_payload: dict[str, Any] = Field(default_factory=dict, repr=False)
+
+
+class Topic(DomainModel):
+    google_id: str
+    course_id: str
+    name: str
+    update_time: AwareDatetime | None = None

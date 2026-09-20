@@ -10,7 +10,7 @@ from typer.testing import CliRunner
 
 from app.cli.commands import app
 from app.config import Settings
-from app.domain.models import Assignment, Course, Submission
+from app.domain.models import Assignment, Course, CourseResource, Submission, Topic
 from app.domain.status import normalize_status
 from app.persistence.database import open_database
 from app.persistence.models import AssignmentRecord, CourseRecord, SubmissionRecord, SyncRun
@@ -48,6 +48,8 @@ class FakeSource:
         ]
         self.fail_courses: set[str] = set()
         self.fail_list = False
+        self.resources: list[CourseResource] = []
+        self.topics: list[Topic] = []
 
     def list_courses(self, *, include_archived=False):
         if self.fail_list:
@@ -61,6 +63,12 @@ class FakeSource:
 
     def list_submissions(self, course_id):
         return deepcopy([s for s in self.submissions if s.course_id == course_id])
+
+    def list_course_resources(self, course_id):
+        return deepcopy([r for r in self.resources if r.course_id == course_id])
+
+    def list_topics(self, course_id):
+        return deepcopy([t for t in self.topics if t.course_id == course_id])
 
 
 @pytest.fixture
@@ -93,7 +101,7 @@ def test_schema_upsert_and_time(database):
         assert change == Change.UNCHANGED
     with database.connect() as conn:
         assert conn.exec_driver_sql("PRAGMA foreign_keys").scalar() == 1
-        assert conn.exec_driver_sql("PRAGMA user_version").scalar() == 3
+        assert conn.exec_driver_sql("PRAGMA user_version").scalar() == 5
 
 
 def test_sync_repeated(database):

@@ -105,9 +105,9 @@ def recover_scope_change(
     if normalize_scopes(old) != frozenset(expected_scopes):
         raise AppError("Scopes solicitados inesperados no fluxo OAuth.") from warning
     actual = require_scopes(token.get("scope"), diagnostic)
-    if require_write and WRITE_SCOPES[0] not in actual:
+    if require_write and not set(WRITE_SCOPES).issubset(actual):
         raise ReauthenticationRequired(
-            "O Google não concedeu o escopo drive.file; execute auth --write novamente."
+            "O Google não concedeu os scopes de escrita; execute auth --write novamente."
         )
     if actual != normalize_scopes(new):
         raise AppError("Scopes inconsistentes na resposta OAuth.") from warning
@@ -158,9 +158,10 @@ def authenticate(
             cached_grant = require_scopes(
                 payload.get("granted_scopes", payload.get("scopes")), diagnostic
             )
-            if require_write and WRITE_SCOPES[0] not in cached_grant:
+            if require_write and not set(WRITE_SCOPES).issubset(cached_grant):
                 raise ReauthenticationRequired(
-                    "Scope drive.file ausente; renomeie GOOGLE_TOKEN_FILE e execute "
+                    "Scopes de escrita ausentes (Drive/Classroom); renomeie "
+                    "GOOGLE_TOKEN_FILE e execute "
                     "python main.py auth --write."
                 )
             # Google ships this factory without a typed signature.

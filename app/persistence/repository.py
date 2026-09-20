@@ -47,6 +47,7 @@ RAW_FIELDS = {
         "maxPoints",
         "workType",
         "multipleChoiceQuestion",
+        "topicId",
     },
     Submission: {
         "id",

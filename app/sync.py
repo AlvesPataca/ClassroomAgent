@@ -7,7 +7,13 @@ from typing import Any, Protocol
 from sqlalchemy import Engine, select, update
 from sqlalchemy.orm import Session
 
-from app.domain.models import Assignment, Course, Submission
+from app.classroom.resources import (
+    attach_resource_materials,
+    save_resource_links,
+    select_resources,
+    upsert_resources,
+)
+from app.domain.models import Assignment, Course, CourseResource, Submission, Topic
 from app.errors import ReauthenticationRequired
 from app.persistence.models import AssignmentRecord, CourseRecord, SubmissionRecord, SyncRun
 from app.persistence.repository import Change, upsert_assignment, upsert_course, upsert_submission
@@ -17,6 +23,8 @@ class Source(Protocol):
     def list_courses(self, *, include_archived: bool = False) -> list[Course]: ...
     def list_assignments(self, course_id: str) -> list[Assignment]: ...
     def list_submissions(self, course_id: str) -> list[Submission]: ...
+    def list_course_resources(self, course_id: str) -> list[CourseResource]: ...
+    def list_topics(self, course_id: str) -> list[Topic]: ...
 
 
 def utc_now() -> datetime:
@@ -58,6 +66,10 @@ def synchronize(
                 counts["assignments"]["found"] += len(assignments)
                 submissions = source.list_submissions(course.google_id)
                 counts["submissions"]["found"] += len(submissions)
+                resource_loader = getattr(source, "list_course_resources", None)
+                topic_loader = getattr(source, "list_topics", None)
+                resources = resource_loader(course.google_id) if resource_loader else []
+                topics = topic_loader(course.google_id) if topic_loader else []
                 now = clock()
                 # Fetch complete pages before locking; rollback an entire course on any error.
                 with Session(engine) as session:
@@ -65,9 +77,15 @@ def synchronize(
                     try:
                         course_row, change = upsert_course(session, course, now)
                         count_change(delta, "courses", change)
+                        resource_rows = upsert_resources(
+                            session, course_row, resources, topics, now
+                        )
                         known: dict[str, AssignmentRecord] = {}
                         for assignment in assignments:
-                            row, change = upsert_assignment(session, assignment, now, course_row)
+                            selected = select_resources(assignment, resource_rows)
+                            enriched = attach_resource_materials(assignment, selected)
+                            row, change = upsert_assignment(session, enriched, now, course_row)
+                            save_resource_links(session, row, selected, now)
                             known[assignment.google_id] = row
                             count_change(delta, "assignments", change)
                         seen_submissions: set[int] = set()

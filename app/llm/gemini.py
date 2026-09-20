@@ -1,7 +1,9 @@
 """Gemini Developer API, text generation only; billing tier belongs to the key's project."""
 
 import json
+import random
 import re
+import time
 from typing import Any
 
 import requests
@@ -13,17 +15,38 @@ from app.llm.providers import LLMProvider
 
 
 def generation_schema(schema: dict[str, Any]) -> dict[str, Any]:
-    """Keep generation grammar small; full limits remain enforced by local Pydantic."""
+    """Keep generation grammar small; full limits remain enforced by local Pydantic.
 
-    def convert(value: Any) -> Any:
+    The REST structured-output validator is stricter than JSON Schema itself on
+    some model deployments.  Inline Pydantic's local references so the request
+    contains only a shallow schema made of the documented primitive keywords.
+    """
+
+    definitions = schema.get("$defs", {})
+
+    def convert(value: Any, resolving: frozenset[str] = frozenset()) -> Any:
         if isinstance(value, dict):
-            return {
-                key: convert(child)
-                for key, child in value.items()
-                if key not in {"minLength", "maxLength", "minItems", "maxItems", "title"}
-            }
+            reference = value.get("$ref")
+            if isinstance(reference, str) and reference.startswith("#/$defs/"):
+                name = reference.removeprefix("#/$defs/")
+                target = definitions.get(name)
+                if isinstance(target, dict) and name not in resolving:
+                    return convert(target, resolving | {name})
+            allowed = {"type", "properties", "required", "items", "enum"}
+            output: dict[str, Any] = {}
+            for key, child in value.items():
+                if key not in allowed:
+                    continue
+                if key == "properties" and isinstance(child, dict):
+                    output[key] = {
+                        name: convert(property_schema, resolving)
+                        for name, property_schema in child.items()
+                    }
+                else:
+                    output[key] = convert(child, resolving)
+            return output
         if isinstance(value, list):
-            return [convert(child) for child in value]
+            return [convert(child, resolving) for child in value]
         return value
 
     result: dict[str, Any] = convert(schema)
@@ -62,26 +85,75 @@ class GeminiProvider(LLMProvider):
     def __init__(self, settings: Settings) -> None:
         if not settings.gemini_api_key.get_secret_value():
             raise AppError("Configure GEMINI_API_KEY no .env com uma chave do Google AI Studio.")
-        if not re.fullmatch(r"gemini-[a-z0-9.-]{1,65}", settings.gemini_model):
+        model_pattern = r"gemini-[a-z0-9.-]{1,65}"
+        if not re.fullmatch(model_pattern, settings.gemini_model) or not re.fullmatch(
+            model_pattern, settings.gemini_fallback_model
+        ):
             raise AppError("GEMINI_MODEL inválido; use o identificador do modelo, sem URL.")
         self.model = settings.gemini_model
+        self._models = list(
+            dict.fromkeys(
+                (
+                    settings.gemini_model,
+                    settings.gemini_fallback_model,
+                    "gemini-3.6-flash",
+                    "gemini-3.5-flash",
+                )
+            )
+        )
         self._key = settings.gemini_api_key
         self._timeout = settings.gemini_timeout_seconds
+        self._max_retries = settings.max_retries
 
     def generate(self, system: str, data: str, schema: dict[str, Any]) -> str:
+        for model_index, model in enumerate(self._models):
+            self.model = model
+            busy_attempt = 0
+            structured = True
+            while busy_attempt <= self._max_retries:
+                try:
+                    return self._generate_once(
+                        model, system, data, schema if structured else None
+                    )
+                except ProviderFailure as exc:
+                    if exc.code == "GEMINI_SCHEMA" and structured:
+                        # Some generateContent deployments reject JSON Schema even
+                        # when the model supports JSON output. Keep responseMimeType
+                        # and enforce the complete Pydantic schema locally instead.
+                        structured = False
+                        continue
+                    last_attempt = busy_attempt == self._max_retries
+                    final_model = model_index + 1 == len(self._models)
+                    transient = exc.code in {"GEMINI_BUSY", "GEMINI_LIMIT", "ACCESS"}
+                    exhausted_final = final_model and (
+                        exc.code != "GEMINI_BUSY" or last_attempt
+                    )
+                    if not transient or exhausted_final:
+                        raise
+                    if exc.code != "GEMINI_BUSY" or last_attempt:
+                        break
+                    time.sleep(min(2**busy_attempt, 8) + random.uniform(0, 0.5))
+                    busy_attempt += 1
+        raise AssertionError("Unreachable")
+
+    def _generate_once(
+        self, model: str, system: str, data: str, schema: dict[str, Any] | None
+    ) -> str:
+        generation_config: dict[str, Any] = {
+            "responseMimeType": "application/json",
+            "maxOutputTokens": 16000,
+        }
+        if schema:
+            generation_config["responseJsonSchema"] = generation_schema(schema)
         payload = {
             "systemInstruction": {"parts": [{"text": system}]},
             "contents": [{"role": "user", "parts": [{"text": data}]}],
-            "generationConfig": {
-                "responseMimeType": "application/json",
-                "candidateCount": 1,
-                "maxOutputTokens": 16000,
-            },
+            "generationConfig": generation_config,
         }
         try:
             with requests.post(
                 "https://generativelanguage.googleapis.com/v1beta/models/"
-                + self.model
+                + model
                 + ":generateContent",
                 headers={"x-goog-api-key": self._key.get_secret_value()},
                 json=payload,

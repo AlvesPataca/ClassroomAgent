@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from app.domain.models import Assignment, Course, Submission
+from app.domain.models import Assignment, Course, CourseResource, Submission, Topic
 
 
 def resolve_due_datetime(
@@ -61,6 +61,7 @@ def map_assignment(raw: dict[str, Any], timezone: str = "America/Sao_Paulo") -> 
         alternate_link=raw.get("alternateLink"),
         work_type=raw.get("workType", "COURSE_WORK_TYPE_UNSPECIFIED"),
         max_points=raw.get("maxPoints"),
+        topic_id=raw.get("topicId"),
         state=raw.get("state", "COURSE_WORK_STATE_UNSPECIFIED"),
         raw_payload=deepcopy(raw),
     )
@@ -78,4 +79,32 @@ def map_submission(raw: dict[str, Any]) -> Submission:
         creation_time=raw.get("creationTime"),
         update_time=raw.get("updateTime"),
         raw_payload=deepcopy(raw),
+    )
+
+
+def map_course_resource(raw: dict[str, Any], kind: str) -> CourseResource:
+    materials = raw.get("materials", [])
+    if not isinstance(materials, list) or any(not isinstance(item, dict) for item in materials):
+        raise ValueError("Invalid course resource materials")
+    return CourseResource(
+        google_id=raw["id"],
+        course_id=raw["courseId"],
+        kind=kind,
+        title=raw.get("title") or (raw.get("text") or "Comunicado")[:200],
+        description=raw.get("description") or raw.get("text"),
+        topic_id=raw.get("topicId"),
+        materials=deepcopy(materials),
+        creation_time=raw.get("creationTime"),
+        update_time=raw.get("updateTime"),
+        alternate_link=raw.get("alternateLink"),
+        raw_payload=deepcopy(raw),
+    )
+
+
+def map_topic(raw: dict[str, Any], course_id: str) -> Topic:
+    return Topic(
+        google_id=raw["topicId"],
+        course_id=course_id,
+        name=raw["name"],
+        update_time=raw.get("updateTime"),
     )

@@ -77,7 +77,7 @@ def solve_context(
                 context_hash=context_hash(context),
                 created_at=now,
                 updated_at=now,
-                request_metadata={"schema_version": 4, "prompt_version": 2, "attempts": 0},
+                request_metadata={"schema_version": 5, "prompt_version": 2, "attempts": 0},
             )
             session.add(row)
             session.flush()
@@ -127,6 +127,7 @@ def solve_context(
             failed = session.get(SolutionRecord, row_id)
             assert failed is not None
             failed.status = "FAILED"
+            failed.model = provider.model
             failed.error = message
             failed.updated_at = datetime.now(UTC)
             failed.request_metadata = {**failed.request_metadata, "attempts": attempts}
@@ -135,6 +136,7 @@ def solve_context(
         saved = session.get(SolutionRecord, row_id)
         assert saved is not None
         saved.response = solution.model_dump()
+        saved.model = provider.model
         saved.answer = solution.answer
         saved.status = "NEEDS_REVIEW"  # No automatic approval, even for valid structured responses.
         saved.updated_at = datetime.now(UTC)

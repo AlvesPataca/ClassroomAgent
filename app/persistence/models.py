@@ -58,6 +58,39 @@ class SubmissionRecord(Record, Base):
     assignment_id: Mapped[int] = mapped_column(ForeignKey("assignments.id"), index=True)
 
 
+class CourseResourceRecord(Base):
+    __tablename__ = "course_resources"
+    __table_args__ = (UniqueConstraint("course_id", "kind", "google_id"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    course_id: Mapped[int] = mapped_column(ForeignKey("courses.id"), index=True)
+    google_id: Mapped[str] = mapped_column(String, nullable=False)
+    kind: Mapped[str] = mapped_column(String, nullable=False)
+    title: Mapped[str] = mapped_column(String, nullable=False)
+    description: Mapped[str | None] = mapped_column(String)
+    topic_id: Mapped[str | None] = mapped_column(String, index=True)
+    topic_name: Mapped[str | None] = mapped_column(String)
+    materials: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    alternate_link: Mapped[str | None] = mapped_column(String)
+    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    creation_time: Mapped[datetime | None] = mapped_column(AwareTimestamp())
+    update_time: Mapped[datetime | None] = mapped_column(AwareTimestamp())
+    first_seen_at: Mapped[datetime] = mapped_column(AwareTimestamp(), nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(AwareTimestamp(), nullable=False)
+    present: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+
+class AssignmentResourceLink(Base):
+    __tablename__ = "assignment_resource_links"
+    __table_args__ = (UniqueConstraint("assignment_id", "resource_id"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    assignment_id: Mapped[int] = mapped_column(ForeignKey("assignments.id"), index=True)
+    resource_id: Mapped[int] = mapped_column(ForeignKey("course_resources.id"), index=True)
+    score: Mapped[int] = mapped_column(Integer, nullable=False)
+    reasons: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    selected: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    updated_at: Mapped[datetime] = mapped_column(AwareTimestamp(), nullable=False)
+
+
 class SyncRun(Base):
     __tablename__ = "sync_runs"
     __table_args__ = (CheckConstraint("status IN ('RUNNING', 'SUCCESS', 'PARTIAL', 'FAILED')"),)

@@ -29,7 +29,9 @@ from app.persistence.models import AssignmentRecord, SolutionRecord
 from app.persistence.reader import LocalReader
 from app.sync import synchronize
 
-app = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False)
+app = typer.Typer(
+    invoke_without_command=True, no_args_is_help=False, pretty_exceptions_enable=False
+)
 console = Console()
 errors = Console(stderr=True)
 ArchiveOption = Annotated[
@@ -41,8 +43,40 @@ CourseOption = Annotated[str | None, typer.Option("--course", help="ID Google do
 
 @app.callback()
 def main(ctx: typer.Context, debug: bool = False) -> None:
-    """Classroom Agent — consultas somente leitura para alunos."""
+    """Classroom Agent — fluxo local contínuo para atividades."""
     ctx.obj = {"debug": debug}
+    if ctx.invoked_subcommand is None:
+        _run_automation(ctx, once=False)
+
+
+def _run_automation(ctx: typer.Context, *, once: bool) -> None:
+    from app.automation import run_forever
+    from app.logging_config import configure_logging
+
+    try:
+        settings = load_settings()
+        logger = configure_logging(settings)
+
+        def emit(message: str) -> None:
+            console.print(message)
+            logger.info(message)
+
+        console.print(
+            "Classroom Agent iniciado. Soluções e anexos de rascunho automáticos; "
+            "turn-in desativado."
+        )
+        logger.info("Processo automático iniciado; modo_once=%s", once)
+        run_forever(settings, once=once, log=emit)
+    except KeyboardInterrupt:
+        console.print("Fluxo encerrado pelo usuário.")
+    except AppError as exc:
+        fail(ctx, exc)
+
+
+@app.command()
+def run(ctx: typer.Context, once: bool = typer.Option(False, "--once")) -> None:
+    """Executa o fluxo automático continuamente ou uma vez com --once."""
+    _run_automation(ctx, once=once)
 
 
 def fail(ctx: typer.Context, exc: AppError) -> None:
@@ -101,7 +135,7 @@ def auth(
     write: bool = typer.Option(
         False,
         "--write",
-        help="Solicita também o escopo mínimo drive.file para upload de PDFs.",
+        help="Solicita scopes para upload no Drive e anexos de rascunho no Classroom.",
     ),
 ) -> None:
     """Autoriza a conta Google e salva/renova o token local."""
@@ -120,7 +154,11 @@ def auth(
         )
         console.print(
             "Conta autenticada. "
-            + ("Escopo drive.file concedido para upload." if write else "Acesso somente leitura.")
+            + (
+                "Scopes de escrita concedidos para Drive e anexos no Classroom."
+                if write
+                else "Acesso somente leitura."
+            )
         )
     except (SQLAlchemyError, OSError, ValueError):
         fail(ctx, AppError("Falha no banco/configuração local; confira caminho e permissões."))
@@ -381,6 +419,8 @@ def phase4_command(
                         f"Prazo: {context.due_at or 'Sem prazo'}\nEstado: {context.state}\n"
                         f"Pontos máximos: {context.max_points}\n"
                         f"Anexos: {len(context.attachments) or 'nenhum'}\n"
+                        f"Materiais relacionados da turma: "
+                        f"{len(context.related_materials) or 'nenhum'}\n"
                         f"Forms: {len(context.forms) or 'nenhum'}\n"
                         f"Ready for AI: {'SIM' if context.ready_for_ai else 'NÃO'}"
                     )
@@ -403,6 +443,14 @@ def phase4_command(
                         Text(
                             f"Anexo #{attachment.local_id}: {attachment.title.text}; "
                             f"{attachment.status}; texto disponível: {bool(attachment.content)}"
+                        )
+                    )
+                for material in context.related_materials:
+                    console.print(
+                        Text(
+                            f"Material relacionado #{material.local_id}: "
+                            f"{material.title.text}; relevância {material.score}%; "
+                            f"{'; '.join(material.reasons) or 'sem justificativa'}"
                         )
                     )
                 for item in context.missing_context + context.warnings:
@@ -522,30 +570,34 @@ def generate(
     solution_version: int | None = typer.Option(None, "--solution-version"),
     upload: bool = typer.Option(False, "--upload"),
 ) -> None:
-    """Gera PDF versionado a partir de solução local revisável."""
+    """Gera PDF e os arquivos solicitados pela atividade."""
     try:
         settings = load_settings()
         engine = open_database(settings.database_file)
         try:
-            artifact = DocumentBuilder(engine, settings).build(
+            artifacts = DocumentBuilder(engine, settings).build_all(
                 assignment_local_id, solution_version, template
             )
-            console.print(
-                f"Solução/template: {artifact.solution_id}/{artifact.template}; "
-                f"artifact v{artifact.version}"
-            )
-            console.print(f"PDF: {artifact.local_path}")
+            for artifact in artifacts:
+                console.print(
+                    f"Solução/template: {artifact.solution_id}/{artifact.template}; "
+                    f"artifact v{artifact.version}"
+                )
+                console.print(f"{artifact.artifact_type}: {artifact.local_path}")
             if upload:
-                uploaded = DriveUploader(
+                uploader = DriveUploader(
                     engine,
                     settings,
                     DriveClient.from_credentials(
                         authenticate(settings, require_write=True), settings
                     ).service,
-                ).upload(artifact.id)
-                console.print(
-                    f"Upload: {uploaded.status}; link: {uploaded.drive_web_view_link or '—'}"
                 )
+                for artifact in artifacts:
+                    uploaded = uploader.upload(artifact.id)
+                    console.print(
+                        f"Upload {Path(uploaded.local_path).name}: {uploaded.status}; "
+                        f"link: {uploaded.drive_web_view_link or '—'}"
+                    )
         finally:
             engine.dispose()
     except AppError as exc:
@@ -556,7 +608,7 @@ def generate(
 
 @app.command()
 def artifacts(ctx: typer.Context, assignment_local_id: int) -> None:
-    """Lista PDFs gerados para uma atividade."""
+    """Lista PDFs e arquivos de entrega gerados para uma atividade."""
     try:
         from app.persistence.models import GeneratedArtifact
 
@@ -580,7 +632,7 @@ def artifacts(ctx: typer.Context, assignment_local_id: int) -> None:
 
 @app.command()
 def upload(ctx: typer.Context, assignment_local_id: int) -> None:
-    """Envia o último PDF pendente para a pasta controlada do Drive."""
+    """Envia todos os arquivos pendentes da atividade para o Drive."""
     try:
         settings = load_settings()
         engine = open_database(settings.database_file)
@@ -588,24 +640,29 @@ def upload(ctx: typer.Context, assignment_local_id: int) -> None:
             from app.persistence.models import GeneratedArtifact
 
             with Session(engine) as s:
-                artifact = s.scalars(
+                artifacts = list(s.scalars(
                     select(GeneratedArtifact)
-                    .where(GeneratedArtifact.assignment_id == assignment_local_id)
-                    .order_by(GeneratedArtifact.version.desc())
-                ).first()
-            if artifact is None:
+                    .where(
+                        GeneratedArtifact.assignment_id == assignment_local_id,
+                        GeneratedArtifact.status == "UPLOAD_PENDING",
+                    )
+                    .order_by(GeneratedArtifact.version)
+                ))
+            if not artifacts:
                 raise AppError("Nenhum artifact gerado para esta atividade.")
             drive = DriveClient.from_credentials(
                 authenticate(settings, require_write=True), settings
             )
             try:
-                result = DriveUploader(engine, settings, drive.service).upload(artifact.id)
+                uploader = DriveUploader(engine, settings, drive.service)
+                results = [uploader.upload(artifact.id) for artifact in artifacts]
             finally:
                 drive.close()
-            console.print(
-                f"Pasta: {result.drive_folder_id}; arquivo: {Path(result.local_path).name}; "
-                f"status: {result.status}; link: {result.drive_web_view_link or '—'}"
-            )
+            for result in results:
+                console.print(
+                    f"Pasta: {result.drive_folder_id}; arquivo: {Path(result.local_path).name}; "
+                    f"status: {result.status}; link: {result.drive_web_view_link or '—'}"
+                )
         finally:
             engine.dispose()
     except AppError as exc:

@@ -60,6 +60,16 @@ class AttachmentContext(StrictModel):
     content: SourceText | None = None
 
 
+class RelatedMaterialContext(StrictModel):
+    local_id: int
+    kind: str
+    title: SourceText
+    description: SourceText
+    topic: SourceText | None = None
+    score: int = Field(ge=0, le=100)
+    reasons: list[str] = Field(default_factory=list)
+
+
 class SubmissionContext(StrictModel):
     state: str
     assigned_grade: float | None = None
@@ -68,7 +78,7 @@ class SubmissionContext(StrictModel):
 
 
 class AssignmentContext(StrictModel):
-    schema_version: int = 4
+    schema_version: int = 5
     assignment_local_id: int
     course_local_id: int
     course: SourceText
@@ -85,6 +95,7 @@ class AssignmentContext(StrictModel):
     forms: list[FormContext]
     questions: list[Question]
     attachments: list[AttachmentContext]
+    related_materials: list[RelatedMaterialContext] = Field(default_factory=list)
     ready_for_ai: bool
     missing_context: list[str]
     readiness_evidence: list[str]

@@ -15,6 +15,7 @@ from app.context.models import (
     FormContext,
     LinkContext,
     Question,
+    RelatedMaterialContext,
     SourceText,
     SourceType,
     SubmissionContext,
@@ -24,8 +25,10 @@ from app.context.safety import URL_PATTERN, public_url, sanitize
 from app.errors import AppError
 from app.persistence.models import (
     AssignmentRecord,
+    AssignmentResourceLink,
     AttachmentRecord,
     CourseRecord,
+    CourseResourceRecord,
     SubmissionRecord,
     SyncRun,
 )
@@ -53,7 +56,17 @@ def sufficient(text: str) -> bool:
         text,
     ):
         return False
-    return bool(
+    if re.search(r"(?i)\b(?:slide|slides|material|anexo|conteúdo|conteudo|aula)\b", text):
+        remainder = re.sub(
+            r"(?i)\b(?:atividade|trabalho|exercício|exercicio|referente|basead[oa]|"
+            r"faça|faca|realize|responda|sobre|ao|aos|no|nos|do|dos|de|da|das|"
+            r"slide|slides|material|anexo|conteúdo|conteudo|aula)\b",
+            " ",
+            text,
+        )
+        if len(re.findall(r"(?u)\b\w{3,}\b", remainder)) < 2:
+            return False
+    if bool(
         re.search(
             r"(?i)\b(?:explique|compare|descreva|calcule|resolva|implemente|escreva|elabore|"
             r"analise|demonstre|justifique|defina|pesquise|crie|construa|construir|"
@@ -62,7 +75,16 @@ def sufficient(text: str) -> bool:
             r"\b\s+\S.{2,}|\S.{4,}\?",
             text,
         )
+    ):
+        return True
+    # Classroom descriptions are often noun phrases rather than imperative sentences.
+    # Accept substantive text while continuing to reject generic routing/instructions.
+    generic = re.fullmatch(
+        r"(?is)(?:leia|veja|confira|acesse|observe)(?:\s+com\s+atenção)?[\s.!:;-]*",
+        text,
     )
+    words = re.findall(r"(?u)\b\w{3,}\b", text)
+    return not generic and len(text) >= 18 and len(words) >= 4
 
 
 class Budget:
@@ -246,6 +268,41 @@ def build_assignment_context(
                     content=content,
                 )
             )
+        related_materials: list[RelatedMaterialContext] = []
+        related_rows = session.execute(
+            select(AssignmentResourceLink, CourseResourceRecord)
+            .join(
+                CourseResourceRecord,
+                CourseResourceRecord.id == AssignmentResourceLink.resource_id,
+            )
+            .where(
+                AssignmentResourceLink.assignment_id == assignment_id,
+                AssignmentResourceLink.selected.is_(True),
+                CourseResourceRecord.present.is_(True),
+            )
+            .order_by(AssignmentResourceLink.score.desc(), CourseResourceRecord.id)
+        ).all()
+        budget.hashes["related_materials"] = digest(
+            [
+                [resource.id, resource.fingerprint, link_row.score, link_row.reasons]
+                for link_row, resource in related_rows
+            ]
+        )
+        for link_row, resource in related_rows:
+            origin = f"course_resource:{resource.id}"
+            related_materials.append(
+                RelatedMaterialContext(
+                    local_id=resource.id,
+                    kind=resource.kind,
+                    title=budget.text(resource.title, origin + ":title", 2000),
+                    description=budget.text(resource.description or "", origin + ":description"),
+                    topic=budget.text(resource.topic_name, origin + ":topic", 512)
+                    if resource.topic_name
+                    else None,
+                    score=link_row.score,
+                    reasons=[sanitize(reason) for reason in link_row.reasons],
+                )
+            )
         questions: list[Question] = []
         if work_type in {"MULTIPLE_CHOICE_QUESTION", "SHORT_ANSWER_QUESTION"}:
             choices = assignment.raw_payload.get("multipleChoiceQuestion", {}).get("choices", [])
@@ -266,7 +323,9 @@ def build_assignment_context(
                 warnings.append("TRUNCATED: assignment choices")
         if forms:
             sources.append("FORM_TASK")
-        if attachments or any(not form_identity(link_.url)[0] for link_ in links):
+        if related_materials or attachments or any(
+            not form_identity(link_.url)[0] for link_ in links
+        ):
             sources.append("MATERIAL_TASK")
         form_types = {q.task_type for f in forms for q in f.questions} - {"UNKNOWN"}
         if types == ["UNKNOWN"] and form_types:
@@ -289,6 +348,8 @@ def build_assignment_context(
             readiness.append("Perguntas obtidas pela Forms API.")
         if any(a.content and sufficient(a.content.text) for a in attachments):
             readiness.append("Texto extraído contém enunciado candidato.")
+        if any(sufficient(material.description.text) for material in related_materials):
+            readiness.append("Descrição de material relacionado contém instruções úteis.")
         missing: list[str] = []
         for form in forms:
             if form.status != "QUESTIONS_AVAILABLE":
@@ -296,6 +357,10 @@ def build_assignment_context(
         if not readiness:
             missing.append(
                 "Enunciado insuficiente/incerto. Forneça as perguntas ou instruções completas."
+            )
+        if related_materials and any(a.status != "EXTRACTED" for a in attachments):
+            missing.append(
+                "Há material relacionado ainda não extraído; execute fetch-attachments e extract."
             )
         if any(w.startswith("TRUNCATED:") for w in warnings):
             # Safe failure: never silently solve a truncated instruction set.
@@ -347,6 +412,7 @@ def build_assignment_context(
             forms=forms,
             questions=questions,
             attachments=attachments,
+            related_materials=related_materials,
             ready_for_ai=bool(readiness),
             missing_context=missing,
             readiness_evidence=readiness,

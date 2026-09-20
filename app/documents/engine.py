@@ -32,6 +32,25 @@ class Template(StrEnum):
     CODE_ASSIGNMENT = "code-assignment"
 
 
+TEXT_DELIVERABLES = {
+    ".html": "HTML",
+    ".htm": "HTML",
+    ".css": "CSS",
+    ".js": "JAVASCRIPT",
+    ".json": "JSON",
+    ".xml": "XML",
+    ".py": "PYTHON",
+    ".java": "JAVA",
+    ".c": "C",
+    ".h": "HEADER",
+    ".cpp": "CPP",
+    ".sql": "SQL",
+    ".md": "MARKDOWN",
+    ".txt": "TEXT",
+    ".csv": "CSV",
+}
+
+
 def _safe(value: str, fallback: str = "document") -> str:
     value = re.sub(r"[<>:\\|?*\x00-\x1f]", " ", value or "")
     value = re.sub(r"[\s./]+", " ", value).strip(" .")
@@ -50,6 +69,26 @@ def _esc(value: Any) -> str:
     from xml.sax.saxutils import escape
 
     return escape(str(value or "")).replace("\n", "<br/>")
+
+
+def _deliverable_name(value: object) -> str | None:
+    """Accept one harmless filename, never a path supplied by the model."""
+    if not isinstance(value, str) or Path(value).name != value:
+        return None
+    name = re.sub(r"[^A-Za-z0-9._ -]", "_", value).strip(" .")[:120]
+    if not name or name.lower() in {".env", "token.json", "credentials.json", "classroom.db"}:
+        return None
+    return name if Path(name).suffix.lower() in TEXT_DELIVERABLES else None
+
+
+def _deliverable_content(value: object) -> str | None:
+    if not isinstance(value, str) or not value.strip() or "\x00" in value:
+        return None
+    text = value.strip()
+    fenced = re.fullmatch(r"```[A-Za-z0-9_+.-]*\s*\n(.*)\n```", text, re.DOTALL)
+    if fenced:
+        text = fenced.group(1)
+    return text + ("" if text.endswith("\n") else "\n")
 
 
 def _markdown_blocks(value: Any, styles: Any) -> list[Any]:
@@ -219,6 +258,89 @@ class DocumentBuilder:
                 )
                 s.commit()
             raise AppError("Falha segura ao gerar PDF.") from exc
+
+    def build_all(
+        self, assignment_id: int, solution_version: int | None = None, override: str | None = None
+    ) -> list[GeneratedArtifact]:
+        """Create the review PDF plus concrete text/source files requested by the task."""
+        pdf = self.build(assignment_id, solution_version, override)
+        with Session(self.engine) as s:
+            solution_row = s.get(SolutionRecord, pdf.solution_id)
+            solution = solution_row.response if solution_row else None
+        output = [pdf]
+        if not solution:
+            return output
+        for spec in solution.get("artifacts", []):
+            if not isinstance(spec, dict):
+                continue
+            name = _deliverable_name(spec.get("filename") or spec.get("title"))
+            content = _deliverable_content(spec.get("content") or spec.get("specification"))
+            if name and content:
+                output.append(
+                    self._write_deliverable(assignment_id, pdf.solution_id, name, content)
+                )
+        return output
+
+    def _write_deliverable(
+        self, assignment_id: int, solution_id: int, name: str, content: str
+    ) -> GeneratedArtifact:
+        data = content.encode("utf-8")
+        if len(data) > 2_000_000:
+            raise AppError(f"Artefato {name} excede o limite de 2 MB.")
+        assignment, course = self._assignment(assignment_id)
+        folder = (
+            self.settings.generated_root.resolve()
+            / _safe(str(course.get("id", assignment.course_id)))
+            / str(assignment_id)
+        )
+        folder.mkdir(parents=True, exist_ok=True)
+        with Session(self.engine) as s:
+            version = (
+                s.scalar(
+                    select(func.max(GeneratedArtifact.version)).where(
+                        GeneratedArtifact.assignment_id == assignment_id
+                    )
+                )
+                or 0
+            ) + 1
+            path = folder / name
+            if path.exists():
+                path = folder / f"{Path(name).stem} - v{version}{Path(name).suffix}"
+            now = datetime.now(UTC)
+            artifact = GeneratedArtifact(
+                solution_id=solution_id,
+                assignment_id=assignment_id,
+                artifact_type=TEXT_DELIVERABLES[Path(name).suffix.lower()],
+                template="DELIVERABLE",
+                version=version,
+                local_path=str(path),
+                content_hash=hashlib.sha256(data).hexdigest(),
+                status="GENERATING",
+                created_at=now,
+                updated_at=now,
+            )
+            s.add(artifact)
+            s.commit()
+            s.refresh(artifact)
+        try:
+            path.write_bytes(data)
+            with Session(self.engine) as s:
+                saved = s.get(GeneratedArtifact, artifact.id)
+                assert saved
+                saved.status = "UPLOAD_PENDING"
+                saved.updated_at = datetime.now(UTC)
+                s.commit()
+                s.refresh(saved)
+                return saved
+        except OSError as exc:
+            with Session(self.engine) as s:
+                saved = s.get(GeneratedArtifact, artifact.id)
+                assert saved
+                saved.status = "FAILED"
+                saved.error = "Falha ao gravar artefato solicitado"
+                saved.updated_at = datetime.now(UTC)
+                s.commit()
+            raise AppError(f"Falha segura ao gerar {name}.") from exc
 
     def _render(
         self,

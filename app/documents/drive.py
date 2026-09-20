@@ -12,6 +12,25 @@ from app.config import Settings
 from app.errors import AppError
 from app.persistence.models import GeneratedArtifact
 
+UPLOAD_MIME_TYPES = {
+    ".pdf": "application/pdf",
+    ".html": "text/html",
+    ".htm": "text/html",
+    ".css": "text/css",
+    ".js": "text/javascript",
+    ".json": "application/json",
+    ".xml": "application/xml",
+    ".py": "text/x-python",
+    ".java": "text/x-java-source",
+    ".c": "text/x-c",
+    ".h": "text/x-c",
+    ".cpp": "text/x-c++src",
+    ".sql": "application/sql",
+    ".md": "text/markdown",
+    ".txt": "text/plain",
+    ".csv": "text/csv",
+}
+
 
 class DriveUploader:
     def __init__(self, engine: Engine, settings: Settings, service: Any) -> None:
@@ -26,7 +45,8 @@ class DriveUploader:
                 return artifact
             path = Path(artifact.local_path).resolve()
             root = self.settings.generated_root.resolve()
-            if root not in path.parents or path.suffix.lower() != ".pdf" or not path.is_file():
+            mime = UPLOAD_MIME_TYPES.get(path.suffix.lower())
+            if root not in path.parents or mime is None or not path.is_file():
                 raise AppError("Caminho do artifact recusado por segurança.")
             if path.name.lower() in {".env", "token.json", "credentials.json", "classroom.db"}:
                 raise AppError("Arquivo sensível recusado.")
@@ -39,14 +59,14 @@ class DriveUploader:
                     parent = self._create_folder(self._course_name(artifact.assignment_id), parent)
                 media = __import__(
                     "googleapiclient.http", fromlist=["MediaFileUpload"]
-                ).MediaFileUpload(str(path), mimetype="application/pdf", resumable=True)
+                ).MediaFileUpload(str(path), mimetype=mime, resumable=True)
                 result = (
                     self.service.files()
                     .create(
                         body={
                             "name": path.name,
                             "parents": [parent],
-                            "mimeType": "application/pdf",
+                            "mimeType": mime,
                         },
                         media_body=media,
                         fields="id,parents,webViewLink",

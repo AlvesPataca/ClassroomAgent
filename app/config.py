@@ -13,8 +13,14 @@ SCOPES = (
     "https://www.googleapis.com/auth/classroom.coursework.me.readonly",
     "https://www.googleapis.com/auth/classroom.student-submissions.me.readonly",
     "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/classroom.courseworkmaterials.readonly",
+    "https://www.googleapis.com/auth/classroom.announcements.readonly",
+    "https://www.googleapis.com/auth/classroom.topics.readonly",
 )
-WRITE_SCOPES = ("https://www.googleapis.com/auth/drive.file",)
+WRITE_SCOPES = (
+    "https://www.googleapis.com/auth/drive.file",
+    "https://www.googleapis.com/auth/classroom.coursework.me",
+)
 
 
 class Settings(BaseModel):
@@ -22,6 +28,7 @@ class Settings(BaseModel):
     llm_provider: str = "mock"
     gemini_api_key: SecretStr = Field(default=SecretStr(""), exclude=True, repr=False)
     gemini_model: str = "gemini-3.8-flash"
+    gemini_fallback_model: str = "gemini-3.7-flash"
     gemini_timeout_seconds: int = Field(default=120, ge=1, le=300)
     astra_api_key: SecretStr = Field(default=SecretStr(""), exclude=True, repr=False)
     astra_base_url: str = "https://api.openai.com/v1"
@@ -45,6 +52,11 @@ class Settings(BaseModel):
     drive_responses_folder_id: str = ""
     drive_responses_folder_name: str = "Classroom Agent - Respostas"
     drive_organize_by_course: bool = True
+    automation_interval_hours: int = Field(default=8, ge=1, le=24)
+    log_file: Path = ROOT / "logs" / "classroom-agent.log"
+    log_level: str = "INFO"
+    log_max_bytes: int = Field(default=10 * 1024 * 1024, ge=1024, le=100 * 1024 * 1024)
+    log_backup_count: int = Field(default=5, ge=1, le=20)
 
     @property
     def zone(self) -> ZoneInfo:
@@ -64,6 +76,7 @@ def load_settings(root: Path = ROOT) -> Settings:
             llm_provider=values.get("LLM_PROVIDER") or "mock",
             gemini_api_key=SecretStr(values.get("GEMINI_API_KEY") or ""),
             gemini_model=values.get("GEMINI_MODEL") or "gemini-3.8-flash",
+            gemini_fallback_model=values.get("GEMINI_FALLBACK_MODEL") or "gemini-3.7-flash",
             gemini_timeout_seconds=int(values.get("GEMINI_TIMEOUT_SECONDS") or "120"),
             astra_api_key=SecretStr(values.get("ASTRA_API_KEY") or ""),
             astra_base_url=values.get("ASTRA_BASE_URL") or "https://api.openai.com/v1",
@@ -90,6 +103,11 @@ def load_settings(root: Path = ROOT) -> Settings:
             drive_organize_by_course=(
                 str(values.get("DRIVE_ORGANIZE_BY_COURSE") or "true").lower() == "true"
             ),
+            automation_interval_hours=int(values.get("AUTOMATION_INTERVAL_HOURS") or "8"),
+            log_file=path("LOG_FILE", "logs/classroom-agent.log"),
+            log_level=values.get("LOG_LEVEL") or "INFO",
+            log_max_bytes=int(values.get("LOG_MAX_BYTES") or "10485760"),
+            log_backup_count=int(values.get("LOG_BACKUP_COUNT") or "5"),
         )
         _ = settings.zone
         if settings.credentials_file.resolve() == settings.token_file.resolve():

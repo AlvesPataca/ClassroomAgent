@@ -112,8 +112,8 @@ def test_original_library_raises_after_callback_for_extra_scope():
         "  " + "   ".join([*SCOPES, SCOPES[0]]) + "  ",
         None,
         # Google canonicalizes the requested coursework scope to this name.
-        " ".join([SCOPES[0], SCOPES[2], SCOPES[3]]),
-        " ".join([SCOPES[0], SCOPES[1], SCOPES[3]]),
+        " ".join([SCOPES[0], SCOPES[2], *SCOPES[3:]]),
+        " ".join([SCOPES[0], SCOPES[1], *SCOPES[3:]]),
     ],
 )
 def test_real_flow_persists_valid_grant_and_reloads(tmp_path, scopes):
@@ -292,7 +292,7 @@ def test_refresh_with_canonical_alias_preserves_actual_grant(tmp_path):
         expiry=(datetime.now(UTC) - timedelta(hours=1)).replace(tzinfo=None),
     )
     settings.token_file.write_text(credentials.to_json())
-    canonical = [SCOPES[0], SCOPES[2], SCOPES[3]]
+    canonical = [SCOPES[0], SCOPES[2], *SCOPES[3:]]
     refreshed = Credentials(
         SECRET_ACCESS,
         scopes=SCOPES,
