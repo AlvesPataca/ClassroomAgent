@@ -53,10 +53,7 @@ class Settings(BaseModel):
     drive_responses_folder_name: str = "Classroom Agent - Respostas"
     drive_organize_by_course: bool = True
     automation_interval_hours: int = Field(default=8, ge=1, le=24)
-    log_file: Path = ROOT / "logs" / "classroom-agent.log"
     log_level: str = "INFO"
-    log_max_bytes: int = Field(default=10 * 1024 * 1024, ge=1024, le=100 * 1024 * 1024)
-    log_backup_count: int = Field(default=5, ge=1, le=20)
 
     @property
     def zone(self) -> ZoneInfo:
@@ -104,10 +101,7 @@ def load_settings(root: Path = ROOT) -> Settings:
                 str(values.get("DRIVE_ORGANIZE_BY_COURSE") or "true").lower() == "true"
             ),
             automation_interval_hours=int(values.get("AUTOMATION_INTERVAL_HOURS") or "8"),
-            log_file=path("LOG_FILE", "logs/classroom-agent.log"),
             log_level=values.get("LOG_LEVEL") or "INFO",
-            log_max_bytes=int(values.get("LOG_MAX_BYTES") or "10485760"),
-            log_backup_count=int(values.get("LOG_BACKUP_COUNT") or "5"),
         )
         _ = settings.zone
         if settings.credentials_file.resolve() == settings.token_file.resolve():

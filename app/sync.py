@@ -1,5 +1,6 @@
 """Synchronization orchestration; providers can be tested without Google credentials."""
 
+import logging
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any, Protocol
@@ -17,6 +18,8 @@ from app.domain.models import Assignment, Course, CourseResource, Submission, To
 from app.errors import ReauthenticationRequired
 from app.persistence.models import AssignmentRecord, CourseRecord, SubmissionRecord, SyncRun
 from app.persistence.repository import Change, upsert_assignment, upsert_course, upsert_submission
+
+logger = logging.getLogger("classroom_agent")
 
 
 class Source(Protocol):
@@ -136,8 +139,13 @@ def synchronize(
                         session.rollback()
                         raise
                 successes += 1
-            except Exception:
+            except Exception as exc:
                 # Never persist provider exception text, SQL parameters, or credential material.
+                logger.error(
+                    "Falha ao sincronizar disciplina; posição=%s; tipo=%s; snapshot=preservado",
+                    course_number,
+                    type(exc).__name__,
+                )
                 failures.append(
                     f"Falha na disciplina #{course_number}; snapshot anterior preservado."
                 )
@@ -150,12 +158,14 @@ def synchronize(
             )
         status = "PARTIAL" if failures and successes else "FAILED" if failures else "SUCCESS"
     except ReauthenticationRequired:
+        logger.error("Sincronização requer nova autenticação Google")
         failures.append(
             "Reautenticação necessária para os novos scopes readonly. "
             "Renomeie GOOGLE_TOKEN_FILE (padrão token.json) e execute python main.py auth."
         )
         status = "PARTIAL" if successes else "FAILED"
-    except Exception:
+    except Exception as exc:
+        logger.error("Falha geral na sincronização; tipo=%s", type(exc).__name__)
         failures.append(
             "Falha ao iniciar ou concluir sincronização; confira conexão e autenticação."
         )

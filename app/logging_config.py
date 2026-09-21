@@ -1,32 +1,45 @@
-"""Safe console and rotating-file logging for long-running deployments."""
+"""Central logging configuration for CLI and systemd/journald."""
 
 import logging
-from logging.handlers import RotatingFileHandler
+import sys
+from typing import TextIO
 
 from app.config import Settings
 
 LOGGER_NAME = "classroom_agent"
 
 
-def configure_logging(settings: Settings) -> logging.Logger:
+class _BelowError(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno < logging.ERROR
+
+
+def configure_logging(
+    settings: Settings,
+    *,
+    stdout: TextIO | None = None,
+    stderr: TextIO | None = None,
+) -> logging.Logger:
+    """Send normal events to stdout and errors to stderr without duplication."""
     logger = logging.getLogger(LOGGER_NAME)
     level = getattr(logging, settings.log_level.upper(), logging.INFO)
     logger.setLevel(level)
     logger.propagate = False
     if logger.handlers:
         return logger
-    settings.log_file.parent.mkdir(parents=True, exist_ok=True)
-    formatter = logging.Formatter(
-        "%(asctime)s %(levelname)s %(name)s %(message)s", "%Y-%m-%dT%H:%M:%S%z"
-    )
-    file_handler = RotatingFileHandler(
-        settings.log_file,
-        maxBytes=settings.log_max_bytes,
-        backupCount=settings.log_backup_count,
-        encoding="utf-8",
-    )
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
+    formatter = logging.Formatter("[%(levelname)s] %(message)s")
+
+    output_handler = logging.StreamHandler(stdout or sys.stdout)
+    output_handler.setLevel(logging.DEBUG)
+    output_handler.addFilter(_BelowError())
+    output_handler.setFormatter(formatter)
+
+    error_handler = logging.StreamHandler(stderr or sys.stderr)
+    error_handler.setLevel(logging.ERROR)
+    error_handler.setFormatter(formatter)
+
+    logger.addHandler(output_handler)
+    logger.addHandler(error_handler)
     return logger
 
 

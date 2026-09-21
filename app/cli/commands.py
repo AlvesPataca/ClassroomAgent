@@ -1,3 +1,4 @@
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any
@@ -56,19 +57,14 @@ def _run_automation(ctx: typer.Context, *, once: bool) -> None:
     try:
         settings = load_settings()
         logger = configure_logging(settings)
-
-        def emit(message: str) -> None:
-            console.print(message)
-            logger.info(message)
-
-        console.print(
-            "Classroom Agent iniciado. Soluções e anexos de rascunho automáticos; "
-            "turn-in desativado."
+        logger.info(
+            "Classroom Agent iniciado; modo=%s; intervalo=%sh; turn-in desativado",
+            "uma execução" if once else "contínuo",
+            settings.automation_interval_hours,
         )
-        logger.info("Processo automático iniciado; modo_once=%s", once)
-        run_forever(settings, once=once, log=emit)
+        run_forever(settings, once=once, logger=logger)
     except KeyboardInterrupt:
-        console.print("Fluxo encerrado pelo usuário.")
+        logging.getLogger("classroom_agent").info("Fluxo encerrado pelo usuário")
     except AppError as exc:
         fail(ctx, exc)
 

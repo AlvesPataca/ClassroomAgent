@@ -77,9 +77,7 @@ Copie `.env.example` para `.env`. As variáveis principais são:
 | `DRIVE_RESPONSES_FOLDER_NAME` | Nome usado quando o ID não é informado. |
 | `DRIVE_ORGANIZE_BY_COURSE` | Quando `true`, cria uma subpasta por disciplina. |
 | `AUTOMATION_INTERVAL_HOURS` | Intervalo entre ciclos contínuos; padrão `8` horas. |
-| `LOG_FILE` | Arquivo de log rotativo; padrão `logs/classroom-agent.log`. |
 | `LOG_LEVEL` | Nível do log (`DEBUG`, `INFO`, `WARNING`, `ERROR`); padrão `INFO`. |
-| `LOG_MAX_BYTES`, `LOG_BACKUP_COUNT` | Tamanho máximo e quantidade de arquivos de log rotacionados. |
 
 Não coloque secrets no `.env.example`; use valores locais somente no `.env`.
 
@@ -179,9 +177,17 @@ salva a solução para revisão, gera os arquivos, envia-os ao Drive e anexa-os 
 Não faz `turnIn` no Classroom. A execução é idempotente para o mesmo hash de contexto; mudanças no
 enunciado ou nos materiais criam uma nova versão.
 
-Os eventos aparecem no console e são gravados em `LOG_FILE`. O arquivo usa rotação automática;
-por padrão, cada arquivo tem até 10 MB e são mantidas cinco cópias anteriores. Em um servidor
-Oracle Cloud, aponte `LOG_FILE` para um volume persistente se necessário.
+Os eventos normais são escritos em stdout e os erros em stderr. Em produção, o serviço systemd
+envia ambos ao journald, permitindo acompanhar autenticação, sincronização, atividades elegíveis,
+anexos, geração, upload, rascunhos, duração e próxima execução pelo Cockpit. O agente não depende
+de arquivo `.log` separado. Para consultar diretamente no Ubuntu:
+
+```bash
+sudo journalctl -u classroom-agent.service -f
+```
+
+Os logs registram somente metadados operacionais. Chaves de API, tokens OAuth, arquivos de
+credenciais e o conteúdo das respostas não são registrados.
 
 ## Templates PDF
 
