@@ -1,7 +1,16 @@
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, CheckConstraint, ForeignKey, Integer, String, UniqueConstraint
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    CheckConstraint,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import TypeDecorator
 
@@ -100,6 +109,60 @@ class SyncRun(Base):
     status: Mapped[str] = mapped_column(String, nullable=False, index=True)
     counters: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     error: Mapped[str | None] = mapped_column(String)
+
+
+class AgentStateRecord(Base):
+    __tablename__ = "agent_state"
+    __table_args__ = (CheckConstraint("id = 1"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    mode: Mapped[str] = mapped_column(String, nullable=False, default="unknown")
+    agent_started_at: Mapped[datetime | None] = mapped_column(AwareTimestamp())
+    heartbeat_at: Mapped[datetime | None] = mapped_column(AwareTimestamp())
+    cycle_running: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    cycle_started_at: Mapped[datetime | None] = mapped_column(AwareTimestamp())
+    last_cycle: Mapped[datetime | None] = mapped_column(AwareTimestamp())
+    next_cycle: Mapped[datetime | None] = mapped_column(AwareTimestamp())
+    eligible: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    answered: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    generated: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    errors: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    duration_seconds: Mapped[float | None] = mapped_column(Float)
+    updated_at: Mapped[datetime] = mapped_column(AwareTimestamp(), nullable=False)
+
+
+class AutomationCycleRecord(Base):
+    __tablename__ = "automation_cycles"
+    __table_args__ = (
+        CheckConstraint("status IN ('RUNNING', 'SUCCESS', 'PARTIAL', 'FAILED')"),
+        CheckConstraint("mode IN ('continuous', 'manual', 'once')"),
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    mode: Mapped[str] = mapped_column(String, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    started_at: Mapped[datetime] = mapped_column(AwareTimestamp(), nullable=False, index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(AwareTimestamp())
+    eligible: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    answered: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    generated: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    errors: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    duration_seconds: Mapped[float | None] = mapped_column(Float)
+    error: Mapped[str | None] = mapped_column(String)
+
+
+class AutomationActivityRecord(Base):
+    __tablename__ = "automation_activities"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    cycle_id: Mapped[int] = mapped_column(
+        ForeignKey("automation_cycles.id", ondelete="CASCADE"), index=True
+    )
+    assignment_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    course: Mapped[str] = mapped_column(String, nullable=False)
+    title: Mapped[str] = mapped_column(String, nullable=False)
+    due_at: Mapped[datetime | None] = mapped_column(AwareTimestamp())
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    pdf_generated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    draft_attached: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    recorded_at: Mapped[datetime] = mapped_column(AwareTimestamp(), nullable=False, index=True)
 
 
 class AttachmentRecord(Base):

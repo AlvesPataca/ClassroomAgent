@@ -111,21 +111,31 @@ def test_cycle_logs_operational_metadata_without_answer_content(phase4):
     assert "Explique os princípios SOLID" not in output
 
 
-def test_continuous_flow_logs_summary_duration_and_next_run():
+def test_continuous_flow_logs_summary_duration_and_next_run(tmp_path):
     stream = io.StringIO()
     logger = logging.getLogger("test.automation.schedule")
     logger.handlers = [logging.StreamHandler(stream)]
     logger.setLevel(logging.INFO)
     logger.propagate = False
-    engine = MagicMock()
     drive = MagicMock()
-    times = iter((NOW, NOW + timedelta(seconds=3)))
+    times = iter(
+        (
+            NOW,
+            NOW,
+            NOW + timedelta(seconds=3),
+            NOW + timedelta(seconds=4),
+        )
+    )
+    settings = Settings(
+        automation_interval_hours=8,
+        database_file=tmp_path / "classroom.db",
+        cycle_lock_file=tmp_path / "cycle.lock",
+    )
 
     with (
         patch("app.automation.authenticate", return_value=object()),
         patch("app.automation.ClassroomClient.from_credentials", return_value=MagicMock()),
         patch("app.automation.DriveClient.from_credentials", return_value=drive),
-        patch("app.automation.open_database", return_value=engine),
         patch(
             "app.automation.run_cycle",
             return_value=CycleResult("SUCCESS", eligible=[1], solved=[1], generated=[1]),
@@ -133,7 +143,7 @@ def test_continuous_flow_logs_summary_duration_and_next_run():
         pytest.raises(RuntimeError, match="stop after scheduling"),
     ):
         run_forever(
-            Settings(automation_interval_hours=8),
+            settings,
             logger=logger,
             clock=lambda: next(times),
             timer=iter((10.0, 12.5)).__next__,
@@ -144,4 +154,3 @@ def test_continuous_flow_logs_summary_duration_and_next_run():
     assert "[RESUMO]" in output and "duração=2.5s" in output
     assert "Próxima verificação: 20/09/2026 17:00:00" in output
     drive.close.assert_called_once()
-    engine.dispose.assert_called_once()

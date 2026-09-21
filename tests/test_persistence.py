@@ -101,7 +101,7 @@ def test_schema_upsert_and_time(database):
         assert change == Change.UNCHANGED
     with database.connect() as conn:
         assert conn.exec_driver_sql("PRAGMA foreign_keys").scalar() == 1
-        assert conn.exec_driver_sql("PRAGMA user_version").scalar() == 5
+        assert conn.exec_driver_sql("PRAGMA user_version").scalar() == 6
 
 
 def test_sync_repeated(database):

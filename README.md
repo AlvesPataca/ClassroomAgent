@@ -16,6 +16,7 @@ O Classroom fornece cursos, atividades, submissões e referências a materiais. 
 - **Fase 4:** descoberta de contexto canônico para atividades, leitura opcional de Google Forms, provenance, orçamento de contexto, soluções estruturadas validadas por schema, providers `mock`, Gemini e Astra/OpenAI-compatible, versionamento e comparação por hash.
 - **Fase 5:** `DocumentBuilder` com PDFs versionados, templates `QUESTION_ANSWER`, `ACADEMIC_REPORT` e `CODE_ASSIGNMENT`, persistência de artifacts, organização no Drive por disciplina e upload explícito com scope mínimo `drive.file`.
 - **Fase 6:** fluxo contínuo opcional, com sincronização imediata e verificações a cada 8 horas, seleção de atividades na segunda metade do prazo, solução e geração idempotentes, anexos no rascunho da submissão e sem `turnIn` automático.
+- **Fase 6.1:** API privada versionada para saúde, estado, histórico, atividades recentes e solicitação segura de um ciclo manual.
 
 ## Arquitetura
 
@@ -78,6 +79,9 @@ Copie `.env.example` para `.env`. As variáveis principais são:
 | `DRIVE_ORGANIZE_BY_COURSE` | Quando `true`, cria uma subpasta por disciplina. |
 | `AUTOMATION_INTERVAL_HOURS` | Intervalo entre ciclos contínuos; padrão `8` horas. |
 | `LOG_LEVEL` | Nível do log (`DEBUG`, `INFO`, `WARNING`, `ERROR`); padrão `INFO`. |
+| `API_HOST` | Bind da API privada; padrão seguro `127.0.0.1`. |
+| `API_PORT` | Porta local da API; padrão `8765`. |
+| `CYCLE_LOCK_FILE` | Lock compartilhado pelo agente e API; padrão `data/automation-cycle.lock`. |
 
 Não coloque secrets no `.env.example`; use valores locais somente no `.env`.
 
@@ -188,6 +192,68 @@ sudo journalctl -u classroom-agent.service -f
 
 Os logs registram somente metadados operacionais. Chaves de API, tokens OAuth, arquivos de
 credenciais e o conteúdo das respostas não são registrados.
+
+## API privada de monitoramento
+
+A API é um processo separado e usa o mesmo SQLite e o mesmo executor de ciclo do agente. Ela não
+consulta o Google nos endpoints de leitura. O prefixo `/api/v1` mantém o contrato preparado para
+evoluções do aplicativo Android.
+
+```text
+GET  /api/v1/health
+GET  /api/v1/status
+GET  /api/v1/history?limit=20
+GET  /api/v1/activities?limit=20
+POST /api/v1/run
+```
+
+`limit` aceita valores de 1 a 100. `POST /api/v1/run` retorna `202` e inicia o mesmo ciclo usado
+por `run --once` em uma thread de trabalho. Se o agente ou outra solicitação já estiver executando
+um ciclo, retorna `409`. Um lock de arquivo do sistema operacional coordena os dois processos e é
+liberado automaticamente se o processo terminar. Nenhum endpoint executa comandos arbitrários ou
+faz `turnIn`.
+
+Para testar somente a API local:
+
+```powershell
+.\.venv\Scripts\python.exe api_main.py
+curl.exe http://127.0.0.1:8765/api/v1/health
+curl.exe http://127.0.0.1:8765/api/v1/status
+```
+
+O bind padrão é exclusivamente loopback. Em produção, mantenha `API_HOST=127.0.0.1` e publique o
+serviço apenas dentro da tailnet com Tailscale Serve:
+
+```bash
+sudo tailscale serve --bg http://127.0.0.1:8765
+sudo tailscale serve status
+```
+
+Não use Tailscale Funnel para esta API. O exemplo de serviço separado está em
+`deploy/classroom-agent-api.service.example`; uma falha ou reinício da API não interrompe o agente.
+
+Na VM Ubuntu, revise os caminhos e o usuário do arquivo de exemplo antes de instalá-lo. A sequência
+de atualização é:
+
+```bash
+cd /home/ubuntu/ClassroomAgent
+git pull --ff-only
+./.venv/bin/python -m pip install -e .
+sudo install -m 0644 deploy/classroom-agent-api.service.example /etc/systemd/system/classroom-agent-api.service
+sudo systemctl daemon-reload
+sudo systemctl restart classroom-agent.service
+sudo systemctl enable --now classroom-agent-api.service
+curl --fail http://127.0.0.1:8765/api/v1/health
+sudo tailscale serve --bg http://127.0.0.1:8765
+sudo tailscale serve status
+```
+
+Para acompanhar os dois processos sem arquivos de log paralelos:
+
+```bash
+journalctl -u classroom-agent.service -f
+journalctl -u classroom-agent-api.service -f
+```
 
 ## Templates PDF
 

@@ -16,6 +16,7 @@ from app.auth.google import authenticate
 from app.classroom.client import ClassroomClient
 from app.config import Settings
 from app.context.builder import build_assignment_context, context_hash
+from app.cycle_lock import CycleLock
 from app.documents.drive import DriveUploader
 from app.documents.engine import DocumentBuilder
 from app.domain.models import Assignment, Submission
@@ -23,6 +24,13 @@ from app.domain.status import normalize_status
 from app.errors import AppError
 from app.llm.providers import LLMProvider, get_provider
 from app.llm.service import solve_context
+from app.monitoring import (
+    finish_cycle,
+    mark_agent_started,
+    mark_agent_stopped,
+    schedule_next,
+    start_cycle,
+)
 from app.persistence.database import open_database
 from app.persistence.models import (
     AssignmentRecord,
@@ -41,6 +49,7 @@ class CycleResult:
     solved: list[int] = field(default_factory=list)
     generated: list[int] = field(default_factory=list)
     skipped: list[int] = field(default_factory=list)
+    attached: list[int] = field(default_factory=list)
     errors: dict[int, str] = field(default_factory=dict)
 
 
@@ -61,6 +70,13 @@ class DeliveryResult:
 def _log_text(value: object, limit: int = 180) -> str:
     """Keep external titles and safe errors on one compact log line."""
     return " ".join(str(value).split())[:limit]
+
+
+def _constant_clock(value: datetime) -> Callable[[], datetime]:
+    def read() -> datetime:
+        return value
+
+    return read
 
 
 def _assignment_label(engine: Engine, assignment_id: int) -> AssignmentLabel:
@@ -305,6 +321,7 @@ def run_cycle(
                 "[OK] Rascunho atualizado no Classroom; novos_anexos=%s; turn_in=false",
                 delivery.attached,
             )
+            result.attached.append(assignment_id)
         except (AppError, OSError, ValueError) as exc:
             result.errors[assignment_id] = str(exc)
             reason = (
@@ -320,6 +337,115 @@ def run_cycle(
     return result
 
 
+class CycleAlreadyRunning(AppError):
+    pass
+
+
+def run_single_cycle(
+    settings: Settings,
+    *,
+    mode: str,
+    logger: logging.Logger | None = None,
+    acquired_lock: CycleLock | None = None,
+    clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+    timer: Callable[[], float] = time.monotonic,
+) -> CycleResult | None:
+    active_logger = logger or logging.getLogger("classroom_agent")
+    lock = acquired_lock or CycleLock(settings.cycle_lock_file)
+    # The API reserves this same lock before returning 202 so it can answer 409
+    # atomically. acquire() is idempotent for that already-held instance, which
+    # keeps lock validation and ownership in the shared executor for every mode.
+    if not lock.acquire():
+        raise CycleAlreadyRunning("A cycle is already running")
+    started = clock()
+    started_monotonic = timer()
+    active_logger.info("Iniciando ciclo automático; origem=%s", mode)
+    drive: DriveClient | None = None
+    engine: Engine | None = None
+    try:
+        engine = open_database(settings.database_file)
+        cycle_id = start_cycle(engine, mode, started)
+    except Exception:
+        if engine is not None:
+            engine.dispose()
+        lock.release()
+        raise
+    result: CycleResult | None = None
+    try:
+        credentials = authenticate(settings, require_write=True)
+        active_logger.info("[OK] Autenticação Google carregada")
+        classroom = ClassroomClient.from_credentials(credentials, settings)
+        drive = DriveClient.from_credentials(credentials, settings)
+        active_logger.info("[OK] Clientes Google Classroom e Drive preparados")
+        result = run_cycle(engine, settings, classroom, drive, now=started, logger=active_logger)
+        duration = timer() - started_monotonic
+        finished = started + timedelta(seconds=duration)
+        finish_cycle(engine, cycle_id, finished, duration, result)
+        active_logger.info(
+            "[RESUMO] elegíveis=%s; respondidas=%s; geradas=%s; erros=%s; duração=%.1fs",
+            len(result.eligible),
+            len(result.solved),
+            len(result.generated),
+            len(result.errors),
+            duration,
+        )
+        return result
+    except AppError as exc:
+        duration = timer() - started_monotonic
+        finish_cycle(
+            engine,
+            cycle_id,
+            started + timedelta(seconds=duration),
+            duration,
+            result,
+            safe_error=_log_text(exc),
+        )
+        active_logger.error(
+            "Ciclo automático falhou; motivo=%s; duração=%.1fs; "
+            "nova_tentativa=próximo_horário",
+            _log_text(exc),
+            duration,
+        )
+        return None
+    except (OSError, ValueError):
+        duration = timer() - started_monotonic
+        finish_cycle(
+            engine,
+            cycle_id,
+            started + timedelta(seconds=duration),
+            duration,
+            result,
+            safe_error="erro local durante a operação",
+        )
+        active_logger.error(
+            "Ciclo automático falhou por erro local; duração=%.1fs; "
+            "nova_tentativa=próximo_horário",
+            duration,
+        )
+        return None
+    except Exception as exc:
+        duration = timer() - started_monotonic
+        finish_cycle(
+            engine,
+            cycle_id,
+            started + timedelta(seconds=duration),
+            duration,
+            result,
+            safe_error=f"falha técnica: {type(exc).__name__}",
+        )
+        active_logger.error(
+            "Falha técnica inesperada no ciclo; tipo=%s; duração=%.1fs",
+            type(exc).__name__,
+            duration,
+        )
+        raise
+    finally:
+        if drive is not None:
+            drive.close()
+        engine.dispose()
+        lock.release()
+
+
 def run_forever(
     settings: Settings,
     *,
@@ -331,61 +457,34 @@ def run_forever(
 ) -> None:
     active_logger = logger or logging.getLogger("classroom_agent")
     interval = timedelta(hours=settings.automation_interval_hours)
-    while True:
-        started = clock()
-        started_monotonic = timer()
-        active_logger.info("Iniciando ciclo automático")
-        drive: DriveClient | None = None
-        engine: Engine | None = None
-        try:
-            credentials = authenticate(settings, require_write=True)
-            active_logger.info("[OK] Autenticação Google carregada")
-            classroom = ClassroomClient.from_credentials(credentials, settings)
-            drive = DriveClient.from_credentials(credentials, settings)
-            active_logger.info("[OK] Clientes Google Classroom e Drive preparados")
-            engine = open_database(settings.database_file)
-            result = run_cycle(
-                engine, settings, classroom, drive, now=started, logger=active_logger
-            )
+    state_engine = open_database(settings.database_file)
+    if not once:
+        mark_agent_started(state_engine, clock())
+    try:
+        while True:
+            started = clock()
+            try:
+                run_single_cycle(
+                    settings,
+                    mode="once" if once else "continuous",
+                    logger=active_logger,
+                    clock=_constant_clock(started),
+                    timer=timer,
+                )
+            except CycleAlreadyRunning:
+                active_logger.warning("Ciclo ignorado: outra execução já está em andamento")
+            if once:
+                return
+            next_run = started + interval
+            current = clock()
+            schedule_next(state_engine, next_run, current)
+            seconds = max(1.0, (next_run - current).total_seconds())
             active_logger.info(
-                "[RESUMO] elegíveis=%s; respondidas=%s; geradas=%s; erros=%s; duração=%.1fs",
-                len(result.eligible),
-                len(result.solved),
-                len(result.generated),
-                len(result.errors),
-                timer() - started_monotonic,
+                "Próxima verificação: %s",
+                next_run.astimezone(settings.zone).strftime("%d/%m/%Y %H:%M:%S"),
             )
-        except AppError as exc:
-            active_logger.error(
-                "Ciclo automático falhou; motivo=%s; duração=%.1fs; "
-                "nova_tentativa=próximo_horário",
-                _log_text(exc),
-                timer() - started_monotonic,
-            )
-        except (OSError, ValueError):
-            active_logger.error(
-                "Ciclo automático falhou por erro local; duração=%.1fs; "
-                "nova_tentativa=próximo_horário",
-                timer() - started_monotonic,
-            )
-        except Exception as exc:
-            active_logger.error(
-                "Falha técnica inesperada no ciclo; tipo=%s; duração=%.1fs",
-                type(exc).__name__,
-                timer() - started_monotonic,
-            )
-            raise
-        finally:
-            if drive is not None:
-                drive.close()
-            if engine is not None:
-                engine.dispose()
-        if once:
-            return
-        next_run = started + interval
-        seconds = max(1.0, (next_run - clock()).total_seconds())
-        active_logger.info(
-            "Próxima verificação: %s",
-            next_run.astimezone(settings.zone).strftime("%d/%m/%Y %H:%M:%S"),
-        )
-        wait(seconds)
+            wait(seconds)
+    finally:
+        if not once:
+            mark_agent_stopped(state_engine, clock())
+        state_engine.dispose()

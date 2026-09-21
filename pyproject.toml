@@ -14,10 +14,11 @@ dependencies = [
   "google-auth-oauthlib>=1.2,<2", "google-auth-httplib2>=0.2,<1",
   "httplib2>=0.22,<1", "pydantic>=2.9,<3", "python-dotenv>=1,<2",
   "typer>=0.15,<1", "rich>=13.9,<15", "tzdata>=2024.2", "oauthlib>=3.2,<4",
+  "fastapi>=0.115,<1", "uvicorn>=0.34,<1",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8,<10", "ruff>=0.9,<1", "mypy>=1.14,<2", "types-defusedxml", "types-requests"]
+dev = ["pytest>=8,<10", "ruff>=0.9,<1", "mypy>=1.14,<2", "types-defusedxml", "types-requests", "httpx>=0.28,<1"]
 
 [tool.setuptools.packages.find]
 include = ["app*"]

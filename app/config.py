@@ -54,6 +54,9 @@ class Settings(BaseModel):
     drive_organize_by_course: bool = True
     automation_interval_hours: int = Field(default=8, ge=1, le=24)
     log_level: str = "INFO"
+    api_host: str = "127.0.0.1"
+    api_port: int = Field(default=8765, ge=1, le=65535)
+    cycle_lock_file: Path = ROOT / "data" / "automation-cycle.lock"
 
     @property
     def zone(self) -> ZoneInfo:
@@ -102,6 +105,9 @@ def load_settings(root: Path = ROOT) -> Settings:
             ),
             automation_interval_hours=int(values.get("AUTOMATION_INTERVAL_HOURS") or "8"),
             log_level=values.get("LOG_LEVEL") or "INFO",
+            api_host=values.get("API_HOST") or "127.0.0.1",
+            api_port=int(values.get("API_PORT") or "8765"),
+            cycle_lock_file=path("CYCLE_LOCK_FILE", "data/automation-cycle.lock"),
         )
         _ = settings.zone
         if settings.credentials_file.resolve() == settings.token_file.resolve():
