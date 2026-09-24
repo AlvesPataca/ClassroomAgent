@@ -20,12 +20,41 @@ MESSAGES = {
     "NETWORK": "Falha de conexão com a API. Confira rede/proxy/TLS.",
     "PROTOCOL": "Resposta da API em formato inesperado.",
     "INCOMPLETE": "API retornou resposta incompleta ou excedeu limite de saída.",
-    "VALIDATION": "Resposta inválida após um reparo: schema, fontes ou questões inconsistentes.",
+    "VALIDATION": "Resposta inválida após reparo: invalid_schema.",
     "UNKNOWN": "Falha de geração/validação não classificada; nenhuma resposta válida salva.",
 }
 
 
 class ProviderFailure(AppError):
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, *, validation_reason: str | None = None) -> None:
         self.code = code if code in MESSAGES else "UNKNOWN"
-        super().__init__(MESSAGES[self.code])
+        self.validation_reason = None
+        message = MESSAGES[self.code]
+        if self.code == "VALIDATION" and validation_reason in {
+            "invalid_json",
+            "invalid_schema",
+            "missing_deliverable",
+            "empty_deliverable",
+            "missing_answer",
+            "empty_answer",
+            "missing_understanding",
+            "empty_understanding",
+            "invalid_sources",
+            "questions_inconsistent",
+            "classification_template_inconsistent",
+            "unsafe_response_content",
+            "response_too_large",
+            "missing_summary",
+            "missing_assignment_types",
+            "missing_question_answers",
+            "missing_artifacts",
+            "missing_assumptions",
+            "missing_uncertainties",
+            "missing_sources_used",
+            "missing_requires_user_input",
+            "missing_warnings",
+            "other_validation_error",
+        }:
+            self.validation_reason = validation_reason
+            message = f"Resposta inválida após reparo: {validation_reason}."
+        super().__init__(message)

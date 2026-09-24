@@ -1,30 +1,168 @@
+import json
+import logging
 import re
 from datetime import UTC, datetime
+from typing import Any, get_args
 
 from pydantic import ValidationError
 from sqlalchemy import Engine, func, select
 from sqlalchemy.orm import Session
 
 from app.context.builder import context_hash
-from app.context.models import AssignmentContext
+from app.context.models import AssignmentContext, TaskType
 from app.context.safety import sanitize
 from app.errors import AppError
 from app.llm.errors import MESSAGES, ProviderFailure
-from app.llm.prompt import build_prompt, build_system_prompt
+from app.llm.prompt import (
+    build_prompt,
+    build_repair_system_prompt,
+    build_system_prompt,
+    solution_template,
+)
 from app.llm.providers import LLMProvider
 from app.llm.schema import Solution
 from app.persistence.models import SolutionRecord
 
+logger = logging.getLogger(__name__)
+SOLUTION_SCHEMA_VERSION = 6
+SOLUTION_PROMPT_VERSION = 4
+_TASK_TYPES = frozenset(get_args(TaskType))
+
+
+class SolutionValidationError(ValueError):
+    """A validation failure represented only by a safe, stable reason code."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
+def _validation_reason(exc: ValidationError) -> str:
+    errors = exc.errors(include_input=False)
+    if any(item.get("type") == "json_invalid" for item in errors):
+        return "invalid_json"
+    for field, missing, empty in (
+        ("deliverable", "missing_deliverable", "empty_deliverable"),
+        ("answer", "missing_answer", "empty_answer"),
+        ("understanding", "missing_understanding", "empty_understanding"),
+    ):
+        matches = [item for item in errors if item.get("loc", (None,))[0] == field]
+        if matches:
+            if any(item.get("type") == "missing" for item in matches):
+                return missing
+            if any(item.get("type") == "string_too_short" for item in matches):
+                return empty
+            return "invalid_schema"
+    for item in errors:
+        location = item.get("loc", ())
+        field_name = location[0] if location else None
+        if field_name == "sources_used":
+            return "invalid_sources"
+        if field_name == "question_answers":
+            return "questions_inconsistent"
+        if field_name == "assignment_types":
+            return (
+                "missing_assignment_types"
+                if item.get("type") == "missing"
+                else ("classification_template_inconsistent")
+            )
+        if (
+            item.get("type") == "missing"
+            and isinstance(field_name, str)
+            and field_name in Solution.model_fields
+        ):
+            return f"missing_{field_name}"
+    return "invalid_schema"
+
+
+def _candidate_types(candidate: dict[str, Any] | None) -> list[str] | None:
+    if candidate is None:
+        return None
+    values = candidate.get("assignment_types")
+    if (
+        isinstance(values, list)
+        and values
+        and all(isinstance(value, str) and value in _TASK_TYPES for value in values)
+    ):
+        return values
+    return None
+
+
+def _safe_repair_candidate(raw: str) -> dict[str, Any] | None:
+    """Keep only bounded, parsed, schema-shaped and sanitized prior model content."""
+    if len(raw) > 200_000:
+        return None
+    try:
+        candidate = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(candidate, dict) or not set(candidate) <= set(Solution.model_fields):
+        return None
+
+    def clean(value: object) -> bool:
+        if isinstance(value, str):
+            return sanitize(value) == value
+        if isinstance(value, list):
+            return all(clean(item) for item in value)
+        if isinstance(value, dict):
+            return all(isinstance(key, str) and clean(item) for key, item in value.items())
+        return value is None or isinstance(value, (bool, int, float))
+
+    if not clean(candidate):
+        return None
+    for key, allowed in (
+        ("question_answers", {"question_id", "answer"}),
+        ("artifacts", {"kind", "title", "specification"}),
+    ):
+        values = candidate.get(key, [])
+        if not isinstance(values, list) or any(
+            not isinstance(item, dict) or not set(item) <= allowed for item in values
+        ):
+            return None
+    return candidate
+
+
+def _validation_fields(raw: str, context: AssignmentContext) -> dict[str, object]:
+    try:
+        value = json.loads(raw)
+    except (ValueError, TypeError):
+        value = {}
+    if not isinstance(value, dict):
+        value = {}
+    types = value.get("assignment_types")
+    if (
+        isinstance(types, list)
+        and types
+        and all(isinstance(item, str) and item in _TASK_TYPES for item in types)
+    ):
+        template = solution_template(types).replace("-", "_").upper()
+    elif context.assignment_types and set(context.assignment_types) != {"UNKNOWN"}:
+        template = solution_template(list(context.assignment_types)).replace("-", "_").upper()
+    else:
+        template = "UNKNOWN"
+    answer = value.get("answer")
+    deliverable = value.get("deliverable")
+    return {
+        "template": template,
+        "answer_present": isinstance(answer, str) and bool(answer.strip()),
+        "answer_length": len(answer) if isinstance(answer, str) else 0,
+        "deliverable_present": isinstance(deliverable, str) and bool(deliverable.strip()),
+        "deliverable_length": len(deliverable) if isinstance(deliverable, str) else 0,
+    }
+
 
 def validate_solution(raw: str, context: AssignmentContext) -> Solution:
     if len(raw) > 200000:
-        raise ValueError("Response too large")
-    result = Solution.model_validate_json(raw, strict=True)
+        raise SolutionValidationError("response_too_large")
+    try:
+        result = Solution.model_validate_json(raw, strict=True)
+    except ValidationError as exc:
+        raise SolutionValidationError(_validation_reason(exc)) from None
 
     # Refuse recognizable credentials/paths in generated fields, never persist raw failures.
     def inspect_text(value: object) -> None:
         if isinstance(value, str) and sanitize(value) != value:
-            raise ValueError("Unsafe response text")
+            raise SolutionValidationError("unsafe_response_content")
         if isinstance(value, dict):
             for child in value.values():
                 inspect_text(child)
@@ -35,17 +173,14 @@ def validate_solution(raw: str, context: AssignmentContext) -> Solution:
     inspect_text(result.model_dump())
     unknown_sources = set(result.sources_used) - set(context.provenance)
     if unknown_sources:
-        # Models sometimes paraphrase a provenance key. Never trust the paraphrase;
-        # discard it and keep the structured answer reviewable with an explicit warning.
-        result.sources_used = [s for s in result.sources_used if s in context.provenance]
-        result.warnings.append("Fontes citadas pelo modelo não reconhecidas foram descartadas.")
+        raise SolutionValidationError("invalid_sources")
     questions = context.questions + [q for f in context.forms for q in f.questions]
     expected = {q.id for q in questions}
     supplied = [q.question_id for q in result.question_answers]
     if len(supplied) != len(set(supplied)) or not set(supplied) <= expected:
-        raise ValueError("Unknown or duplicate questions")
+        raise SolutionValidationError("questions_inconsistent")
     if not result.requires_user_input and expected != set(supplied):
-        raise ValueError("Missing answers")
+        raise SolutionValidationError("questions_inconsistent")
     # Match the same template source as DocumentBuilder, which classifies from
     # the validated solution. Context classification can be UNKNOWN or disagree.
     task_types = set(result.assignment_types)
@@ -53,9 +188,9 @@ def validate_solution(raw: str, context: AssignmentContext) -> Solution:
         task_types & {"LONG_FORM", "RESEARCH"}
     )
     if academic_report and not result.deliverable.strip():
-        raise ValueError("Missing academic deliverable")
+        raise SolutionValidationError("empty_deliverable")
     if not academic_report and result.deliverable:
-        raise ValueError("Unexpected deliverable for specialized template")
+        raise SolutionValidationError("classification_template_inconsistent")
     return result
 
 
@@ -87,7 +222,11 @@ def solve_context(
                 context_hash=context_hash(context),
                 created_at=now,
                 updated_at=now,
-                request_metadata={"schema_version": 6, "prompt_version": 3, "attempts": 0},
+                request_metadata={
+                    "schema_version": SOLUTION_SCHEMA_VERSION,
+                    "prompt_version": SOLUTION_PROMPT_VERSION,
+                    "attempts": 0,
+                },
             )
             session.add(row)
             session.flush()
@@ -95,43 +234,69 @@ def solve_context(
         connection.commit()
     solution: Solution | None = None
     attempts = 0
+    validation_reasons: list[str] = []
+    repair_candidate: dict[str, Any] | None = None
     try:
         for attempt in range(2):
             attempts += 1
-            system = build_system_prompt(context)
             if attempt:
-                # Controlled regeneration: don't echo hostile invalid output or validation values.
-                system += (
-                    "\nA tentativa anterior falhou na validação. Gere novamente seguindo o schema."
-                    " Use exatamente estas chaves obrigatórias: summary, assignment_types, "
-                    "understanding, answer, deliverable, question_answers, artifacts, assumptions, "
-                    "uncertainties, sources_used, requires_user_input, warnings. "
-                    "Para uma atividade sem questões, use question_answers=[]; "
-                    "sources_used=[] é aceitável; não invente IDs. Retorne somente JSON."
+                candidate_types = _candidate_types(repair_candidate)
+                system = build_repair_system_prompt(
+                    context, validation_reasons[-1], candidate_types
                 )
-                valid_questions = [q.id for q in context.questions] + [
-                    q.id for form in context.forms for q in form.questions
-                ]
-                system += (
-                    "\nREGRAS EXATAS DE REPARO: question_answers só pode usar estes IDs: "
-                    + repr(valid_questions)
-                    + ". Se a lista estiver vazia, use question_answers=[] e responda em answer. "
-                    "sources_used só pode usar estas chaves de provenance: "
-                    + repr(sorted(context.provenance))
-                    + ". Não crie IDs, fontes ou perguntas alternativas."
-                )
-            raw = provider.generate(system, build_prompt(context), Solution.model_json_schema())
+            else:
+                system = build_system_prompt(context)
+            data = build_prompt(context, repair_candidate if attempt else None)
+            raw = provider.generate(system, data, Solution.model_json_schema())
             try:
                 solution = validate_solution(raw, context)
                 break
-            except (ValidationError, ValueError):
+            except SolutionValidationError as exc:
+                validation_reasons.append(exc.reason)
+                stats = _validation_fields(raw, context)
+                logger.warning(
+                    "solution_validation solution_version=%d template=%s schema_version=%d "
+                    "validation_reason=%s answer_present=%s answer_length=%d "
+                    "deliverable_present=%s deliverable_length=%d repair_attempted=%s "
+                    "repair_valid=false",
+                    version,
+                    stats["template"],
+                    SOLUTION_SCHEMA_VERSION,
+                    exc.reason,
+                    stats["answer_present"],
+                    stats["answer_length"],
+                    stats["deliverable_present"],
+                    stats["deliverable_length"],
+                    attempt > 0,
+                )
                 if attempt:
-                    raise ProviderFailure("VALIDATION") from None
+                    raise ProviderFailure("VALIDATION", validation_reason=exc.reason) from None
+                repair_candidate = _safe_repair_candidate(raw)
+                continue
+            stats = _validation_fields(raw, context)
+            logger.info(
+                "solution_validation solution_version=%d template=%s schema_version=%d "
+                "validation_reason=none answer_present=%s answer_length=%d "
+                "deliverable_present=%s deliverable_length=%d repair_attempted=%s "
+                "repair_valid=%s",
+                version,
+                stats["template"],
+                SOLUTION_SCHEMA_VERSION,
+                stats["answer_present"],
+                stats["answer_length"],
+                stats["deliverable_present"],
+                stats["deliverable_length"],
+                attempt > 0,
+                attempt > 0,
+            )
         if solution is None:
             raise AppError("Nenhuma solução válida.")
     except Exception as exc:
         code = exc.code if isinstance(exc, ProviderFailure) else "UNKNOWN"
         message = MESSAGES.get(code, MESSAGES["UNKNOWN"])
+        validation_reason = exc.validation_reason if isinstance(exc, ProviderFailure) else None
+        if validation_reason:
+            message = f"Resposta inválida após reparo: {validation_reason}."
         # Failure bodies and exception messages can contain keys or hostile content.
         with Session(engine) as session, session.begin():
             failed = session.get(SolutionRecord, row_id)
@@ -140,7 +305,19 @@ def solve_context(
             failed.model = provider.model
             failed.error = message
             failed.updated_at = datetime.now(UTC)
-            failed.request_metadata = {**failed.request_metadata, "attempts": attempts}
+            failed.request_metadata = {
+                **failed.request_metadata,
+                "attempts": attempts,
+                **(
+                    {
+                        "validation_reasons": validation_reasons,
+                        "repair_attempted": attempts > 1,
+                        "repair_valid": False,
+                    }
+                    if validation_reasons
+                    else {}
+                ),
+            }
         raise AppError(f"Solução #{row_id} FAILED: {message}") from None
     with Session(engine, expire_on_commit=False) as session, session.begin():
         saved = session.get(SolutionRecord, row_id)
@@ -150,7 +327,13 @@ def solve_context(
         saved.answer = solution.answer
         saved.status = "NEEDS_REVIEW"  # No automatic approval, even for valid structured responses.
         saved.updated_at = datetime.now(UTC)
-        saved.request_metadata = {**saved.request_metadata, "attempts": attempts}
+        saved.request_metadata = {
+            **saved.request_metadata,
+            "attempts": attempts,
+            "validation_reasons": validation_reasons,
+            "repair_attempted": attempts > 1,
+            "repair_valid": True if attempts > 1 else None,
+        }
         return saved
 
 

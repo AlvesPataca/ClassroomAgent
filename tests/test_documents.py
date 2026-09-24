@@ -507,7 +507,7 @@ def test_solution_validation_uses_response_template_for_deliverable(phase4, requ
         warnings=[],
     )
 
-    with pytest.raises(ValueError, match="Missing academic deliverable"):
+    with pytest.raises(ValueError, match="empty_deliverable"):
         validate_solution(response.model_dump_json(), context)
 
 
