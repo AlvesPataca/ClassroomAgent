@@ -14,6 +14,7 @@ from app.persistence.models import GeneratedArtifact
 
 UPLOAD_MIME_TYPES = {
     ".pdf": "application/pdf",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ".html": "text/html",
     ".htm": "text/html",
     ".css": "text/css",

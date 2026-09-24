@@ -196,6 +196,7 @@ def display_assignments(
     include_archived: bool,
     pending_only: bool,
     api: bool = False,
+    include_overdue: bool = False,
 ) -> None:
     try:
         client = get_reader(api)
@@ -228,12 +229,12 @@ def display_assignments(
                     submission = by_assignment.get((course.google_id, assignment.google_id))
                     status = normalize_status(assignment, submission, now)
                     unknown += status == SubmissionStatus.UNKNOWN
-                    if pending_only and status not in {
-                        SubmissionStatus.PENDING,
-                        SubmissionStatus.MISSING,
-                    }:
-                        continue
                     due = assignment.due_at
+                    overdue = due is not None and due < now
+                    if pending_only and (status != SubmissionStatus.PENDING or overdue):
+                        continue
+                    if not pending_only and overdue and not include_overdue:
+                        continue
                     table.add_row(
                         *(
                             Text(value)
@@ -273,9 +274,12 @@ def assignments(
     course: CourseOption = None,
     include_archived: ArchiveOption = False,
     api: ApiOption = False,
+    include_overdue: bool = typer.Option(
+        False, "--include-overdue", help="Inclui atividades publicadas com prazo vencido."
+    ),
 ) -> None:
-    """Lista atividades publicadas, com status da sua submissão."""
-    display_assignments(ctx, course, include_archived, False, api)
+    """Lista atividades abertas e futuras; use --include-overdue para diagnóstico histórico."""
+    display_assignments(ctx, course, include_archived, False, api, include_overdue)
 
 
 @app.command()
@@ -285,7 +289,7 @@ def pending(
     include_archived: ArchiveOption = False,
     api: ApiOption = False,
 ) -> None:
-    """Lista PENDING e MISSING (pendentes com prazo vencido)."""
+    """Lista somente submissões PENDING que ainda podem ser realizadas."""
     display_assignments(ctx, course, include_archived, True, api)
 
 
@@ -563,16 +567,21 @@ def generate(
     ctx: typer.Context,
     assignment_local_id: int,
     template: str | None = typer.Option(None),
+    output_format: str | None = typer.Option(
+        None,
+        "--format",
+        help="Formato do documento principal: pdf, docx, txt ou md. Padrão: pdf.",
+    ),
     solution_version: int | None = typer.Option(None, "--solution-version"),
     upload: bool = typer.Option(False, "--upload"),
 ) -> None:
-    """Gera PDF e os arquivos solicitados pela atividade."""
+    """Gera o documento no formato escolhido e os arquivos solicitados pela atividade."""
     try:
         settings = load_settings()
         engine = open_database(settings.database_file)
         try:
             artifacts = DocumentBuilder(engine, settings).build_all(
-                assignment_local_id, solution_version, template
+                assignment_local_id, solution_version, template, output_format
             )
             for artifact in artifacts:
                 console.print(
@@ -636,14 +645,16 @@ def upload(ctx: typer.Context, assignment_local_id: int) -> None:
             from app.persistence.models import GeneratedArtifact
 
             with Session(engine) as s:
-                artifacts = list(s.scalars(
-                    select(GeneratedArtifact)
-                    .where(
-                        GeneratedArtifact.assignment_id == assignment_local_id,
-                        GeneratedArtifact.status == "UPLOAD_PENDING",
+                artifacts = list(
+                    s.scalars(
+                        select(GeneratedArtifact)
+                        .where(
+                            GeneratedArtifact.assignment_id == assignment_local_id,
+                            GeneratedArtifact.status == "UPLOAD_PENDING",
+                        )
+                        .order_by(GeneratedArtifact.version)
                     )
-                    .order_by(GeneratedArtifact.version)
-                ))
+                )
             if not artifacts:
                 raise AppError("Nenhum artifact gerado para esta atividade.")
             drive = DriveClient.from_credentials(

@@ -4,11 +4,22 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
 
-from app.automation import CycleResult, reached_midpoint, run_cycle, run_forever
+from app.automation import (
+    CycleResult,
+    eligible_assignment_ids,
+    reached_midpoint,
+    run_cycle,
+    run_forever,
+)
 from app.config import Settings
 from app.domain.models import Assignment, Submission
+from app.domain.status import normalize_status
 from app.llm.providers import MockProvider
+from app.persistence.models import GeneratedArtifact, SolutionRecord
+from app.sync import synchronize
 from tests.test_phase4 import phase4 as phase4  # noqa: F401
 
 NOW = datetime(2026, 9, 20, 12, tzinfo=UTC)
@@ -56,6 +67,32 @@ def test_midpoint_requires_open_pending_second_half():
     assert not reached_midpoint(task, pending, NOW + timedelta(days=1))
 
 
+def test_synced_pending_future_assignment_is_eligible_after_midpoint(phase4):
+    settings, engine, source = phase4
+    source.assignments[0].creation_time = NOW - timedelta(days=2)
+    source.assignments[0].due_at = NOW + timedelta(days=2)
+    source.submissions[0].state = "NEW"
+    assert synchronize(engine, lambda: source).status == "SUCCESS"
+
+    assert eligible_assignment_ids(engine, NOW) == [1]
+    assert normalize_status(source.assignments[0], source.submissions[0], NOW).value == "PENDING"
+    with Session(engine) as session:
+        assert session.scalar(select(func.count()).select_from(SolutionRecord)) == 0
+        assert session.scalar(select(func.count()).select_from(GeneratedArtifact)) == 0
+
+
+def test_eligibility_debug_reports_deadline_window_without_activity_content(phase4, caplog):
+    settings, engine, source = phase4
+    source.assignments[0].creation_time = NOW - timedelta(hours=1)
+    source.assignments[0].due_at = NOW + timedelta(hours=3)
+    assert synchronize(engine, lambda: source).status == "SUCCESS"
+
+    caplog.set_level(logging.DEBUG, logger="classroom_agent")
+    assert eligible_assignment_ids(engine, NOW) == []
+    assert "Atividade local=1 rejeitada; motivo=deadline_window" in caplog.text
+    assert "Original" not in caplog.text
+
+
 def test_cycle_solves_and_generates_once_per_context(phase4):
     settings, engine, source = phase4
     source.assignments[0].creation_time = NOW - timedelta(days=2)
@@ -65,12 +102,8 @@ def test_cycle_solves_and_generates_once_per_context(phase4):
     )
     classroom, drive = automation_clients(source)
 
-    first = run_cycle(
-        engine, settings, classroom, drive, provider=MockProvider(), now=NOW
-    )
-    second = run_cycle(
-        engine, settings, classroom, drive, provider=MockProvider(), now=NOW
-    )
+    first = run_cycle(engine, settings, classroom, drive, provider=MockProvider(), now=NOW)
+    second = run_cycle(engine, settings, classroom, drive, provider=MockProvider(), now=NOW)
 
     assert first.eligible == first.solved == first.generated == [1]
     assert second.eligible == second.skipped == [1]

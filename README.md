@@ -6,7 +6,7 @@ Agente local em Python para consultar o Google Classroom como aluno, sincronizar
 
 `Google Classroom → sync/persistência SQLite → contexto → solução → PDF + arquivos solicitados → revisão local → (upload explícito) Google Drive`
 
-O Classroom fornece cursos, atividades, submissões e referências a materiais. `sync` mantém um snapshot local e também coleta materiais, comunicados e tópicos da turma. A descoberta de contexto reúne a descrição, associa materiais por tópico, texto e proximidade de publicação, além de links, Forms e anexos extraídos com provenance, limites e sanitização. `solve` grava uma resposta estruturada versionada; `generate` cria o PDF de revisão e materializa arquivos textuais pedidos, como HTML, CSS, JavaScript, Python, SQL, Markdown e CSV; `upload` envia os artefatos pendentes para a pasta de respostas configurada.
+O Classroom fornece cursos, atividades, submissões e referências a materiais. `sync` mantém um snapshot local e também coleta materiais, comunicados e tópicos da turma. A descoberta de contexto reúne a descrição, associa materiais por tópico, texto e proximidade de publicação, além de links, Forms e anexos extraídos com provenance, limites e sanitização. `solve` grava uma resposta estruturada versionada; `generate` cria o documento de revisão em PDF, DOCX, TXT ou Markdown e materializa arquivos textuais pedidos, como HTML, CSS, JavaScript, Python, SQL, Markdown e CSV; `upload` envia os artefatos pendentes para a pasta de respostas configurada.
 
 ## Funcionalidades por fase
 
@@ -117,7 +117,7 @@ run [--once]
 auth [--write]
 sync
 courses [--include-archived] [--api]
-assignments [--course ID] [--include-archived] [--api]
+assignments [--course ID] [--include-archived] [--include-overdue] [--api]
 pending [--course ID] [--include-archived] [--api]
 local-assignments
 attachments ASSIGNMENT_LOCAL_ID
@@ -127,12 +127,14 @@ context ASSIGNMENT_LOCAL_ID [--offline] [--json]
 solve ASSIGNMENT_LOCAL_ID [--provider PROVIDER] [--offline]
 solutions ASSIGNMENT_LOCAL_ID [--offline]
 solution SOLUTION_ID
-generate ASSIGNMENT_LOCAL_ID [--template TEMPLATE] [--solution-version N] [--upload]
+generate ASSIGNMENT_LOCAL_ID [--template TEMPLATE] [--format pdf|docx|txt|md] [--solution-version N] [--upload]
 artifacts ASSIGNMENT_LOCAL_ID
 upload ASSIGNMENT_LOCAL_ID
 ```
 
 `--api` consulta o Classroom diretamente; sem ele, os comandos de consulta usam o snapshot local. IDs de anexos e atividades usados por `attachments`, `context`, `solve`, `generate` e `upload` são IDs inteiros locais, exibidos por `local-assignments`.
+
+`pending` mostra somente submissões ainda abertas e com prazo futuro. Atividades sem prazo também aparecem identificadas como `Sem prazo`; atividades vencidas ou já entregues ficam fora dessa listagem. `assignments` oculta prazos vencidos por padrão; use `--include-overdue` para diagnóstico histórico. `local-assignments` continua mostrando todos os registros persistidos, inclusive os marcados como removidos, sem apagar histórico.
 
 ### Fluxo completo
 
@@ -148,6 +150,9 @@ python main.py context 12 --json
 python main.py solve 12 --provider mock
 python main.py solutions 12
 python main.py generate 12 --template academic-report
+python main.py generate 12 --template academic-report --format docx
+python main.py generate 12 --format txt
+python main.py generate 12 --format md
 python main.py artifacts 12
 python main.py auth --write
 python main.py upload 12
@@ -262,6 +267,7 @@ journalctl -u classroom-agent-api.service -f
 - `code-assignment`: inclui cabeçalho acadêmico, resposta e blocos de código/especificações em fonte monoespaçada.
 
 O template pode ser escolhido com `--template`; sem override, o builder escolhe pelo tipo estruturado da solução.
+O formato físico pode ser definido independentemente com `--format pdf`, `--format docx`, `--format txt` ou `--format md`. Sem `--format`, o comportamento anterior permanece: gera o PDF de revisão e os arquivos adicionais solicitados pela atividade. DOCX é renderizado como documento Word real; TXT remove a formatação Markdown preservando texto, listas e código; MD mantém a sintaxe Markdown.
 
 ## Drive e organização por disciplina
 

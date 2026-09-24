@@ -1,8 +1,10 @@
 import json
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
 from google.auth.exceptions import RefreshError
+from sqlalchemy.orm import Session
 from typer.testing import CliRunner
 
 from app.auth.google import authenticate, save_token
@@ -10,6 +12,10 @@ from app.cli.commands import app
 from app.config import SCOPES, Settings, load_settings
 from app.domain.models import Assignment, Course, Submission
 from app.errors import AppError
+from app.persistence.database import open_database
+from app.persistence.models import AssignmentRecord
+from app.sync import synchronize
+from tests.test_persistence import FakeSource
 
 
 def test_config_relative_paths_and_environment(tmp_path, monkeypatch):
@@ -138,6 +144,114 @@ def test_cli_pending_and_partial_failure():
     assert "PENDING" in result.output
     assert "[bold]Literal[/bold]" in result.output
     assert "Resultado parcial" in result.output
+
+
+def test_pending_hides_overdue_and_completed_but_keeps_undated_open_work():
+    now = datetime.now(UTC)
+    client = MagicMock(settings=Settings())
+    course = Course(google_id="c", name="Math", state="ACTIVE")
+    client.list_courses.return_value = [course]
+    client.list_assignments.return_value = [
+        Assignment(
+            google_id="future",
+            course_id="c",
+            title="PENDING futuro",
+            state="PUBLISHED",
+            due_at=now + timedelta(days=2),
+        ),
+        Assignment(
+            google_id="late",
+            course_id="c",
+            title="PENDING vencido",
+            state="PUBLISHED",
+            due_at=now - timedelta(days=1),
+        ),
+        Assignment(
+            google_id="done",
+            course_id="c",
+            title="Concluída",
+            state="PUBLISHED",
+            due_at=now + timedelta(days=2),
+        ),
+        Assignment(google_id="no-due", course_id="c", title="Sem prazo", state="PUBLISHED"),
+    ]
+    client.list_submissions.return_value = [
+        Submission(google_id="s1", course_id="c", assignment_id="future", state="NEW"),
+        Submission(google_id="s2", course_id="c", assignment_id="late", state="NEW"),
+        Submission(google_id="s3", course_id="c", assignment_id="done", state="TURNED_IN"),
+        Submission(google_id="s4", course_id="c", assignment_id="no-due", state="CREATED"),
+    ]
+
+    with patch("app.cli.commands.get_client", return_value=client):
+        result = CliRunner().invoke(app, ["pending", "--api"], env={"COLUMNS": "220"})
+
+    assert result.exit_code == 0, result.output
+    assert "PENDING futuro" in result.output and "Sem prazo" in result.output
+    assert "PENDING vencido" not in result.output
+    assert "Concluída" not in result.output
+    assert "2 atividade(s)" in result.output
+
+
+def test_assignments_has_operational_default_and_overdue_history_flag():
+    now = datetime.now(UTC)
+    client = MagicMock(settings=Settings())
+    client.list_courses.return_value = [Course(google_id="c", name="Math", state="ACTIVE")]
+    client.list_assignments.return_value = [
+        Assignment(
+            google_id="future",
+            course_id="c",
+            title="Atual",
+            state="PUBLISHED",
+            due_at=now + timedelta(days=1),
+        ),
+        Assignment(
+            google_id="old",
+            course_id="c",
+            title="Histórica atrasada",
+            state="PUBLISHED",
+            due_at=now - timedelta(days=300),
+        ),
+    ]
+    client.list_submissions.return_value = [
+        Submission(google_id="s1", course_id="c", assignment_id="future", state="NEW"),
+        Submission(google_id="s2", course_id="c", assignment_id="old", state="NEW"),
+    ]
+
+    with patch("app.cli.commands.get_client", return_value=client):
+        current = CliRunner().invoke(app, ["assignments", "--api"], env={"COLUMNS": "220"})
+        history = CliRunner().invoke(
+            app, ["assignments", "--api", "--include-overdue"], env={"COLUMNS": "220"}
+        )
+
+    assert current.exit_code == history.exit_code == 0
+    assert "Atual" in current.output and "Histórica atrasada" not in current.output
+    assert "Histórica atrasada" in history.output
+
+
+def test_local_assignments_preserves_old_database_history(tmp_path):
+    settings = Settings(database_file=tmp_path / "classroom.db")
+    source = FakeSource()
+    source.assignments[0].creation_time = datetime.now(UTC) - timedelta(days=500)
+    source.assignments[0].due_at = datetime.now(UTC) - timedelta(days=300)
+    engine = open_database(settings.database_file)
+    assert synchronize(engine, lambda: source).status == "SUCCESS"
+    before = engine.connect().exec_driver_sql("SELECT COUNT(*) FROM assignments").scalar_one()
+    engine.dispose()
+
+    with patch("app.cli.commands.load_settings", return_value=settings):
+        result = CliRunner().invoke(app, ["local-assignments"])
+
+    assert result.exit_code == 0 and "Task" in result.output and "True" in result.output
+    engine = open_database(settings.database_file)
+    try:
+        with Session(engine) as session:
+            row = session.query(AssignmentRecord).one()
+            after = session.query(AssignmentRecord).count()
+        assert before == after == 1
+        assert row.present is True
+        assert row.snapshot["title"] == "Task"
+    finally:
+        engine.dispose()
 
 
 def test_debug_never_prints_exception_payload():

@@ -7,21 +7,26 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import cm
 from reportlab.platypus import (
+    PageBreak,
     Paragraph,
     Preformatted,
     SimpleDocTemplate,
     Spacer,
+    Table,
+    TableStyle,
 )
 from sqlalchemy import func, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
 from app.config import Settings
+from app.documents.formatting import Content, Node, clean_text, parse_markdown, text_content
 from app.errors import AppError
 from app.persistence.models import AssignmentRecord, GeneratedArtifact, SolutionRecord
 
@@ -30,6 +35,28 @@ class Template(StrEnum):
     QUESTION_ANSWER = "question-answer"
     ACADEMIC_REPORT = "academic-report"
     CODE_ASSIGNMENT = "code-assignment"
+
+
+class OutputFormat(StrEnum):
+    PDF = "pdf"
+    DOCX = "docx"
+    TXT = "txt"
+    MD = "md"
+
+
+FORMAT_EXTENSIONS = {
+    OutputFormat.PDF: ".pdf",
+    OutputFormat.DOCX: ".docx",
+    OutputFormat.TXT: ".txt",
+    OutputFormat.MD: ".md",
+}
+
+FORMAT_ARTIFACT_TYPES = {
+    OutputFormat.PDF: "PDF",
+    OutputFormat.DOCX: "DOCX",
+    OutputFormat.TXT: "TEXT",
+    OutputFormat.MD: "MARKDOWN",
+}
 
 
 TEXT_DELIVERABLES = {
@@ -91,63 +118,278 @@ def _deliverable_content(value: object) -> str | None:
     return text + ("" if text.endswith("\n") else "\n")
 
 
-def _markdown_blocks(value: Any, styles: Any) -> list[Any]:
-    """Convert the model's lightweight Markdown into readable PDF flowables."""
+def _inline_reportlab(content: list[Content]) -> str:
     from xml.sax.saxutils import escape
 
-    text = str(value or "").replace("```html", "```").replace("```HTML", "```")
-    blocks: list[Any] = []
-    code: list[str] = []
-    in_code = False
-    paragraph: list[str] = []
+    output: list[str] = []
+    for item in content:
+        if isinstance(item, str):
+            output.append(escape(item))
+            continue
+        inner = _inline_reportlab(item.children)
+        if item.tag in {"strong", "b"}:
+            inner = f"<b>{inner}</b>"
+        elif item.tag in {"em", "i"}:
+            inner = f"<i>{inner}</i>"
+        elif item.tag == "code":
+            inner = f"<font name='Courier'>{inner}</font>"
+        elif item.tag in {"del", "s", "strike"}:
+            inner = f"<strike>{inner}</strike>"
+        elif item.tag == "br":
+            inner += "<br/>"
+        output.append(inner)
+    return "".join(output)
 
-    def flush_paragraph() -> None:
-        if paragraph:
-            clean = " ".join(paragraph).strip()
-            clean = re.sub(r"\*{1,3}([^*]+)\*{1,3}", r"<b>\1</b>", clean)
-            clean = re.sub(r"`([^`]+)`", r"<font name='Courier'>\1</font>", clean)
-            blocks.append(
-                Paragraph(
-                    escape(clean).replace("&lt;b&gt;", "<b>").replace("&lt;/b&gt;", "</b>"),
-                    styles["Body"],
+
+def _pdf_blocks(nodes: list[Node], styles: Any, *, depth: int = 0) -> list[Any]:
+    from xml.sax.saxutils import escape
+
+    from reportlab.platypus import HRFlowable
+
+    output: list[Any] = []
+    for node in nodes:
+        if node.tag == "p":
+            if text_content(node.children).strip() == "\\pagebreak":
+                output.append(PageBreak())
+            elif text_content(node.children).strip():
+                output.append(Paragraph(_inline_reportlab(node.children), styles["Body"]))
+        elif node.tag.startswith("h") and node.tag[1:].isdigit():
+            level = min(int(node.tag[1]), 3)
+            output.append(Paragraph(_inline_reportlab(node.children), styles[f"Heading{level}"]))
+        elif node.tag == "pre":
+            output.append(Preformatted(text_content(node.children), styles["CodeBlock"]))
+        elif node.tag in {"ul", "ol"}:
+            ordered = node.tag == "ol"
+            item_number = int(node.attrs.get("start", "1"))
+            for item in node.children:
+                if not isinstance(item, Node) or item.tag != "li":
+                    continue
+                marker = f"{item_number}." if ordered else "•"
+                item_number += 1
+                for child in item.children:
+                    if isinstance(child, str):
+                        if child.strip():
+                            output.append(
+                                Paragraph(
+                                    escape(child.strip()),
+                                    styles["Body"],
+                                    bulletText=marker,
+                                )
+                            )
+                        continue
+                    if not isinstance(child, Node):
+                        continue
+                    if child.tag == "p":
+                        output.append(
+                            Paragraph(
+                                _inline_reportlab(child.children),
+                                styles["Body"],
+                                bulletText=marker,
+                            )
+                        )
+                    elif child.tag in {"ul", "ol"}:
+                        output.extend(_pdf_blocks([child], styles, depth=depth + 1))
+                    else:
+                        output.extend(_pdf_blocks([child], styles, depth=depth + 1))
+        elif node.tag == "table":
+            rows = []
+            for row in _table_rows(node):
+                rows.append(
+                    [Paragraph(_inline_reportlab(cell.children), styles["Body"]) for cell in row]
+                )
+            if rows:
+                output.append(
+                    Table(
+                        rows,
+                        repeatRows=1,
+                        hAlign="LEFT",
+                        style=TableStyle(
+                            [
+                                ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#9aa0a6")),
+                                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf0f2")),
+                                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                                ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                                ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                            ]
+                        ),
+                    )
+                )
+                output.append(Spacer(1, 7))
+        elif node.tag == "blockquote":
+            output.extend(
+                _pdf_blocks(
+                    [child for child in node.children if isinstance(child, Node)],
+                    styles,
+                    depth=depth + 1,
                 )
             )
-            paragraph.clear()
+        elif node.tag == "hr":
+            output.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#9aa0a6")))
+            output.append(Spacer(1, 5))
+        else:
+            output.extend(
+                _pdf_blocks(
+                    [child for child in node.children if isinstance(child, Node)],
+                    styles,
+                    depth=depth,
+                )
+            )
+    return output
 
-    for raw in text.splitlines():
-        line = raw.rstrip()
-        if line.strip().startswith("```"):
-            if in_code:
-                blocks.append(Preformatted("\n".join(code), styles["CodeBlock"]))
-                code.clear()
+
+def _table_rows(node: Node) -> list[list[Node]]:
+    rows: list[list[Node]] = []
+
+    def visit(current: Node) -> None:
+        for child in current.children:
+            if not isinstance(child, Node):
+                continue
+            if child.tag == "tr":
+                rows.append(
+                    [
+                        cell
+                        for cell in child.children
+                        if isinstance(cell, Node) and cell.tag in {"th", "td"}
+                    ]
+                )
             else:
-                flush_paragraph()
-            in_code = not in_code
+                visit(child)
+
+    visit(node)
+    return rows
+
+
+def _append_docx_inline(
+    paragraph: Any,
+    content: list[Content],
+    *,
+    bold: bool = False,
+    italic: bool = False,
+    code: bool = False,
+) -> None:
+    for item in content:
+        if isinstance(item, str):
+            if item:
+                run = paragraph.add_run(item)
+                run.bold, run.italic = bold, italic
+                if code:
+                    run.font.name = "Consolas"
             continue
-        if in_code:
-            code.append(line)
-            continue
-        if not line.strip():
-            flush_paragraph()
-            continue
-        heading = re.match(r"^#{1,3}\s+(.+)$", line)
-        if heading:
-            flush_paragraph()
-            blocks.append(Paragraph(_esc(heading.group(1)), styles["Section"]))
-            continue
-        bullet = re.match(r"^\s*[-*]\s+(.+)$", line)
-        if bullet:
-            flush_paragraph()
-            blocks.append(Paragraph("• " + _esc(bullet.group(1)), styles["Body"]))
-            continue
-        if line.strip().startswith(">"):
-            line = line.strip()[1:].strip()
-        paragraph.append(line)
-    if in_code:
-        blocks.append(Preformatted("\n".join(code), styles["CodeBlock"]))
-    else:
-        flush_paragraph()
-    return blocks
+        _append_docx_inline(
+            paragraph,
+            item.children,
+            bold=bold or item.tag in {"strong", "b"},
+            italic=italic or item.tag in {"em", "i"},
+            code=code or item.tag == "code",
+        )
+        if item.tag == "br":
+            paragraph.add_run().add_break()
+
+
+def _docx_blocks(nodes: list[Node], document: Any, *, depth: int = 0) -> None:
+    from docx.shared import Inches, Pt
+
+    for node in nodes:
+        if node.tag == "p":
+            if text_content(node.children).strip() == "\\pagebreak":
+                document.add_page_break()
+            elif text_content(node.children).strip():
+                paragraph = document.add_paragraph()
+                _append_docx_inline(paragraph, node.children)
+        elif node.tag.startswith("h") and node.tag[1:].isdigit():
+            paragraph = document.add_heading(level=min(int(node.tag[1]), 9))
+            _append_docx_inline(paragraph, node.children)
+        elif node.tag == "pre":
+            paragraph = document.add_paragraph(style="No Spacing")
+            for line_index, line in enumerate(text_content(node.children).splitlines()):
+                if line_index:
+                    paragraph.add_run().add_break()
+                run = paragraph.add_run(line)
+                run.font.name = "Consolas"
+                run.font.size = Pt(9)
+        elif node.tag in {"ul", "ol"}:
+            style = "List Bullet" if node.tag == "ul" else "List Number"
+            for item in node.children:
+                if not isinstance(item, Node) or item.tag != "li":
+                    continue
+                paragraph = document.add_paragraph(style=style)
+                paragraph.paragraph_format.left_indent = Inches(0.25 * depth)
+                for child in item.children:
+                    if isinstance(child, Node) and child.tag in {"ul", "ol"}:
+                        continue
+                    if isinstance(child, Node) and child.tag == "p":
+                        _append_docx_inline(paragraph, child.children)
+                    elif isinstance(child, str):
+                        _append_docx_inline(paragraph, [child])
+                nested = [
+                    child
+                    for child in item.children
+                    if isinstance(child, Node) and child.tag in {"ul", "ol"}
+                ]
+                _docx_blocks(nested, document, depth=depth + 1)
+        elif node.tag == "table":
+            rows = _table_rows(node)
+            if rows:
+                table = document.add_table(rows=0, cols=max(len(row) for row in rows))
+                table.style = "Table Grid"
+                for source_row in rows:
+                    cells = table.add_row().cells
+                    for index, source_cell in enumerate(source_row):
+                        _append_docx_inline(cells[index].paragraphs[0], source_cell.children)
+        elif node.tag == "blockquote":
+            for child in node.children:
+                if isinstance(child, Node):
+                    _docx_blocks([child], document, depth=depth)
+                    if child.tag == "p":
+                        document.paragraphs[-1].style = "Quote"
+        elif node.tag == "hr":
+            document.add_paragraph("────────────────────────────────")
+        else:
+            _docx_blocks(
+                [child for child in node.children if isinstance(child, Node)], document, depth=depth
+            )
+
+
+def _document_sections(
+    template: Template, solution: dict[str, Any]
+) -> list[tuple[str | None, str]]:
+    sections: list[tuple[str | None, str]] = []
+    items = solution.get("question_answers", [])
+    if template == Template.QUESTION_ANSWER:
+        if items:
+            for index, item in enumerate(items, 1):
+                label = str(item.get("question_id") or f"Questão {index}")
+                sections.append((f"{index}. {label}", str(item.get("answer", ""))))
+        elif solution.get("answer"):
+            sections.append((None, str(solution["answer"])))
+        return sections
+    if solution.get("understanding"):
+        sections.append(("Entendimento", str(solution["understanding"])))
+    if solution.get("answer"):
+        sections.append(("Resposta", str(solution["answer"])))
+    for index, item in enumerate(items, 1):
+        label = str(item.get("question_id") or f"Questão {index}")
+        sections.append((f"{index}. {label}", str(item.get("answer", ""))))
+    if template == Template.CODE_ASSIGNMENT:
+        for spec in solution.get("artifacts", []):
+            if not isinstance(spec, dict):
+                continue
+            title = str(spec.get("title") or "Código")
+            if spec.get("kind") == "CODE" or "code" in title.lower():
+                source = str(spec.get("specification") or spec.get("content") or "")
+                fenced = re.fullmatch(
+                    r"(`{3,}|~{3,})[A-Za-z0-9_+.-]*[ \t]*\r?\n([\s\S]*?)\r?\n\1[ \t]*",
+                    source,
+                )
+                if fenced:
+                    source = fenced.group(2)
+                longest_ticks = max((len(run) for run in re.findall(r"`+", source)), default=2)
+                fence = "`" * max(3, longest_ticks + 1)
+                code = source + ("" if source.endswith("\n") else "\n")
+                sections.append((title, f"{fence}text\n{code}{fence}"))
+    return sections
 
 
 class DocumentBuilder:
@@ -169,6 +411,17 @@ class DocumentBuilder:
             return Template.ACADEMIC_REPORT
         return Template.QUESTION_ANSWER
 
+    @staticmethod
+    def choose_format(override: str | OutputFormat | None) -> OutputFormat:
+        try:
+            if override is None:
+                return OutputFormat.PDF
+            if not isinstance(override, (str, OutputFormat)):
+                raise ValueError
+            return OutputFormat(str(override).lower())
+        except (TypeError, ValueError) as exc:
+            raise AppError("Formato inválido; use pdf, docx, txt ou md.") from exc
+
     def _assignment(self, assignment_id: int) -> tuple[AssignmentRecord, dict[str, Any]]:
         with Session(self.engine) as s:
             row = s.get(AssignmentRecord, assignment_id)
@@ -181,8 +434,13 @@ class DocumentBuilder:
             return row, (course.snapshot if course else {})
 
     def build(
-        self, assignment_id: int, solution_version: int | None = None, override: str | None = None
+        self,
+        assignment_id: int,
+        solution_version: int | None = None,
+        override: str | None = None,
+        output_format: str | OutputFormat | None = None,
     ) -> GeneratedArtifact:
+        selected_format = self.choose_format(output_format)
         assignment, course = self._assignment(assignment_id)
         with Session(self.engine) as s:
             q = select(SolutionRecord).where(
@@ -213,15 +471,18 @@ class DocumentBuilder:
             )
             folder.mkdir(parents=True, exist_ok=True)
             base = f"{title} - {subject}"
-            filename = _safe(base, "atividade") + (".pdf" if version == 1 else f" - v{version}.pdf")
+            extension = FORMAT_EXTENSIONS[selected_format]
+            filename = _safe(base, "atividade") + (
+                extension if version == 1 else f" - v{version}{extension}"
+            )
             path = folder / filename
             while path.exists():
                 version += 1
-                path = folder / (_safe(base, "atividade") + f" - v{version}.pdf")
+                path = folder / (_safe(base, "atividade") + f" - v{version}{extension}")
             artifact = GeneratedArtifact(
                 solution_id=solution_row.id,
                 assignment_id=assignment_id,
-                artifact_type="PDF",
+                artifact_type=FORMAT_ARTIFACT_TYPES[selected_format],
                 template=template.name,
                 version=version,
                 local_path=str(path),
@@ -234,7 +495,7 @@ class DocumentBuilder:
             s.commit()
             s.refresh(artifact)
         try:
-            self._render(path, template, solution, assignment.snapshot, course)
+            self._render(path, template, solution, assignment.snapshot, course, selected_format)
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
             with Session(self.engine) as s:
                 saved = s.get(GeneratedArtifact, artifact.id)
@@ -253,21 +514,26 @@ class DocumentBuilder:
                 assert saved
                 saved.status, saved.error, saved.updated_at = (
                     "FAILED",
-                    "Falha ao renderizar PDF",
+                    f"Falha ao renderizar {selected_format.value.upper()}",
                     datetime.now(UTC),
                 )
                 s.commit()
-            raise AppError("Falha segura ao gerar PDF.") from exc
+            raise AppError(f"Falha segura ao gerar {selected_format.value.upper()}.") from exc
 
     def build_all(
-        self, assignment_id: int, solution_version: int | None = None, override: str | None = None
+        self,
+        assignment_id: int,
+        solution_version: int | None = None,
+        override: str | None = None,
+        output_format: str | OutputFormat | None = None,
     ) -> list[GeneratedArtifact]:
-        """Create the review PDF plus concrete text/source files requested by the task."""
-        pdf = self.build(assignment_id, solution_version, override)
+        """Create the selected review document plus task-requested concrete files."""
+        selected_format = self.choose_format(output_format)
+        main_artifact = self.build(assignment_id, solution_version, override, selected_format)
         with Session(self.engine) as s:
-            solution_row = s.get(SolutionRecord, pdf.solution_id)
+            solution_row = s.get(SolutionRecord, main_artifact.solution_id)
             solution = solution_row.response if solution_row else None
-        output = [pdf]
+        output = [main_artifact]
         if not solution:
             return output
         for spec in solution.get("artifacts", []):
@@ -277,7 +543,7 @@ class DocumentBuilder:
             content = _deliverable_content(spec.get("content") or spec.get("specification"))
             if name and content:
                 output.append(
-                    self._write_deliverable(assignment_id, pdf.solution_id, name, content)
+                    self._write_deliverable(assignment_id, main_artifact.solution_id, name, content)
                 )
         return output
 
@@ -349,6 +615,66 @@ class DocumentBuilder:
         solution: dict[str, Any],
         assignment: dict[str, Any],
         course: dict[str, Any],
+        output_format: OutputFormat = OutputFormat.PDF,
+    ) -> None:
+        if output_format == OutputFormat.PDF:
+            self._render_pdf(path, template, solution, assignment, course)
+        elif output_format == OutputFormat.DOCX:
+            self._render_docx(path, template, solution, assignment, course)
+        elif output_format == OutputFormat.TXT:
+            path.write_text(
+                self._plain_document(template, solution, assignment, course), encoding="utf-8"
+            )
+        elif output_format == OutputFormat.MD:
+            path.write_text(
+                self._markdown_document(template, solution, assignment, course), encoding="utf-8"
+            )
+
+    def _header(self, assignment: dict[str, Any], course: dict[str, Any]) -> tuple[str, list[str]]:
+        title = str(assignment.get("title") or "ATIVIDADE")
+        metadata = [f"Data: {datetime.now(self.settings.zone):%d/%m/%Y}"]
+        if self.settings.student_name:
+            metadata.append(f"Aluno: {self.settings.student_name}")
+        metadata.append(f"Matéria: {course.get('name', self.settings.course_name)}")
+        return title, metadata
+
+    def _plain_document(
+        self,
+        template: Template,
+        solution: dict[str, Any],
+        assignment: dict[str, Any],
+        course: dict[str, Any],
+    ) -> str:
+        title, metadata = self._header(assignment, course)
+        parts = [title, *metadata]
+        for heading, markdown in _document_sections(template, solution):
+            if heading:
+                parts.extend(["", heading])
+            parts.extend(["", clean_text(markdown).rstrip()])
+        return "\n".join(parts).strip() + "\n"
+
+    def _markdown_document(
+        self,
+        template: Template,
+        solution: dict[str, Any],
+        assignment: dict[str, Any],
+        course: dict[str, Any],
+    ) -> str:
+        title, metadata = self._header(assignment, course)
+        parts = [f"# {title}", "", *(f"_{line}_  " for line in metadata), ""]
+        for heading, markdown in _document_sections(template, solution):
+            if heading:
+                parts.extend([f"## {heading}", ""])
+            parts.extend([markdown.rstrip(), ""])
+        return "\n".join(parts).rstrip() + "\n"
+
+    def _render_pdf(
+        self,
+        path: Path,
+        template: Template,
+        solution: dict[str, Any],
+        assignment: dict[str, Any],
+        course: dict[str, Any],
     ) -> None:
         styles = getSampleStyleSheet()
         styles.add(
@@ -414,7 +740,8 @@ class DocumentBuilder:
             author=self.settings.student_name or "Classroom Agent",
         )
         story: list[Any] = []
-        title = _esc(assignment.get("title", "ATIVIDADE"))
+        title, metadata = self._header(assignment, course)
+        title = _esc(title)
         if template == Template.CODE_ASSIGNMENT:
             for value in (
                 self.settings.institution,
@@ -426,54 +753,45 @@ class DocumentBuilder:
                     story.append(Paragraph(_esc(value), styles["Meta"]))
             story += [Spacer(1, 14), Paragraph(title, styles["AcademicTitle"])]
         else:
-            story += [
-                Paragraph(title, styles["AcademicTitle"]),
-                Paragraph(
-                    _esc(f"Data: {datetime.now(self.settings.zone):%d/%m/%Y}"), styles["Meta"]
-                ),
-            ]
-            for label, value in (
-                ("Aluno", self.settings.student_name),
-                ("Matéria", course.get("name", self.settings.course_name)),
-            ):
-                if value:
-                    story.append(Paragraph(_esc(f"{label}: {value}"), styles["Meta"]))
-        if template == Template.QUESTION_ANSWER:
-            items = solution.get("question_answers", [])
-            if items:
-                for i, item in enumerate(items, 1):
-                    story += [
-                        Paragraph(
-                            f"<b>{i}. {_esc(item.get('question_id', 'Questão'))}</b>",
-                            styles["Question"],
-                        ),
-                        *_markdown_blocks(item.get("answer", ""), styles),
-                    ]
-            elif solution.get("answer"):
-                story.extend(_markdown_blocks(solution["answer"], styles))
-        else:
-            if solution.get("understanding"):
-                story.extend(_markdown_blocks(solution["understanding"], styles))
-            story.append(Paragraph("Resposta", styles["Section"]))
-            if solution.get("answer"):
-                story.extend(_markdown_blocks(solution["answer"], styles))
-            for i, item in enumerate(solution.get("question_answers", []), 1):
-                story += [
-                    Paragraph(
-                        f"{i}. {_esc(item.get('question_id', 'Questão'))}", styles["Section"]
-                    ),
-                    *_markdown_blocks(item.get("answer", ""), styles),
-                ]
-            for spec in solution.get("artifacts", []):
-                if spec.get("kind") == "CODE" or "code" in spec.get("title", "").lower():
-                    story += [
-                        Paragraph(_esc(spec.get("title", "Código")), styles["Section"]),
-                        Preformatted(
-                            str(spec.get("specification", "")),
-                            styles["CodeBlock"],
-                        ),
-                    ]
+            story.append(Paragraph(title, styles["AcademicTitle"]))
+            for value in metadata:
+                story.append(Paragraph(_esc(value), styles["Meta"]))
+        sections = _document_sections(template, solution)
+        for heading, markdown in sections:
+            if heading:
+                story.append(Paragraph(_esc(heading), styles["Section"]))
+            story.extend(_pdf_blocks(parse_markdown(markdown), styles))
         doc.build(story, onFirstPage=self._footer, onLaterPages=self._footer)
+
+    def _render_docx(
+        self,
+        path: Path,
+        template: Template,
+        solution: dict[str, Any],
+        assignment: dict[str, Any],
+        course: dict[str, Any],
+    ) -> None:
+        from docx import Document
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+        from docx.shared import Inches, Pt
+
+        document = Document()
+        title, metadata = self._header(assignment, course)
+        document.add_heading(title, level=0)
+        for value in metadata:
+            paragraph = document.add_paragraph(value)
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        for heading, markdown in _document_sections(template, solution):
+            if heading:
+                document.add_heading(heading, level=1)
+            nodes = parse_markdown(markdown)
+            _docx_blocks(nodes, document)
+        for section in document.sections:
+            section.top_margin = Inches(0.75)
+            section.bottom_margin = Inches(0.75)
+        document.styles["Normal"].font.name = "Calibri"
+        document.styles["Normal"].font.size = Pt(11)
+        document.save(str(path))
 
     @staticmethod
     def _footer(canvas: Any, doc: Any) -> None:

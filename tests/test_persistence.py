@@ -247,7 +247,7 @@ def test_absence_hides_and_reappearance_reuses_ids(database):
     assert normalize_status(reader.list_assignments("c")[0], None, NOW) == "UNKNOWN"
 
 
-def test_local_pending_order_status_timezone_and_no_auth(database):
+def test_local_pending_hides_overdue_preserves_timezone_and_needs_no_auth(database):
     source = FakeSource()
     for identifier, due in [("z", None), ("b", NOW - timedelta(days=2))]:
         source.assignments.append(
@@ -279,9 +279,10 @@ def test_local_pending_order_status_timezone_and_no_auth(database):
     ):
         result = CliRunner().invoke(app, ["pending"], env={"COLUMNS": "240"})
     assert result.exit_code == 0, result.output
-    assert result.output.index("Task-b") < result.output.index("Task-z")
-    assert "MISSING" in result.output and "PENDING" in result.output
-    assert "-0300" in result.output and "True" in result.output
+    assert "Task-b" not in result.output and "Task-z" in result.output
+    assert "MISSING" not in result.output and "PENDING" in result.output
+    # The timezone is verified from the stored row above. API late flags on
+    # records without a deadline remain visible, but aren't relevant here.
 
 
 def test_cli_empty_local_help_and_failed_sync(tmp_path):

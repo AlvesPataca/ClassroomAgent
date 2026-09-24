@@ -87,53 +87,72 @@ def _assignment_label(engine: Engine, assignment_id: int) -> AssignmentLabel:
             return AssignmentLabel("Disciplina desconhecida", f"Atividade #{assignment_id}", None)
         snapshot = assignment.snapshot
         return AssignmentLabel(
-            _log_text(
-                (course.snapshot if course else {}).get("name") or "Disciplina desconhecida"
-            ),
+            _log_text((course.snapshot if course else {}).get("name") or "Disciplina desconhecida"),
             _log_text(snapshot.get("title") or f"Atividade #{assignment_id}"),
             Assignment.model_validate(snapshot).due_at,
         )
 
 
-def reached_midpoint(
-    assignment: Assignment, submission: Submission | None, now: datetime
-) -> bool:
+def reached_midpoint(assignment: Assignment, submission: Submission | None, now: datetime) -> bool:
     """Return true only during the actionable second half of a defined deadline."""
+    return _eligibility_rejection_reason(assignment, submission, now) is None
+
+
+def _eligibility_rejection_reason(
+    assignment: Assignment, submission: Submission | None, now: datetime
+) -> str | None:
     if now.utcoffset() is None:
         raise ValueError("now must be timezone-aware")
-    if (
-        assignment.state != "PUBLISHED"
-        or assignment.creation_time is None
-        or assignment.due_at is None
-        or assignment.due_at <= assignment.creation_time
-        or now >= assignment.due_at
-    ):
-        return False
+    if assignment.state != "PUBLISHED":
+        return "coursework_state"
+    if assignment.creation_time is None:
+        return "missing_creation_time"
+    if assignment.due_at is None:
+        return "missing_deadline"
+    if assignment.due_at <= assignment.creation_time:
+        return "invalid_deadline_window"
+    if now >= assignment.due_at:
+        return "deadline_passed"
+    if normalize_status(assignment, submission, now).value != "PENDING":
+        return "submission_state"
     midpoint = assignment.creation_time + (assignment.due_at - assignment.creation_time) / 2
-    return now >= midpoint and normalize_status(assignment, submission, now).value == "PENDING"
+    if now < midpoint:
+        return "deadline_window"
+    return None
 
 
-def eligible_assignment_ids(engine: Engine, now: datetime) -> list[int]:
+def eligible_assignment_ids(
+    engine: Engine, now: datetime, *, logger: logging.Logger | None = None
+) -> list[int]:
+    active_logger = logger or logging.getLogger("classroom_agent")
     with Session(engine) as session:
         submissions = {
-            row.assignment_id: Submission.model_validate(row.snapshot)
-            for row in session.scalars(
-                select(SubmissionRecord)
-                .where(SubmissionRecord.present.is_(True))
-                .order_by(SubmissionRecord.id)
-            )
+            row.assignment_id: row
+            for row in session.scalars(select(SubmissionRecord).order_by(SubmissionRecord.id))
         }
-        return [
-            row.id
-            for row in session.scalars(
-                select(AssignmentRecord)
-                .where(AssignmentRecord.present.is_(True))
-                .order_by(AssignmentRecord.id)
+        eligible: list[int] = []
+        for row in session.scalars(select(AssignmentRecord).order_by(AssignmentRecord.id)):
+            if not row.present:
+                active_logger.debug(
+                    "[DEBUG] Atividade local=%s rejeitada; motivo=assignment_not_present",
+                    row.id,
+                )
+                continue
+            assignment = Assignment.model_validate(row.snapshot)
+            submission_row = submissions.get(row.id)
+            submission = (
+                Submission.model_validate(submission_row.snapshot)
+                if submission_row is not None and submission_row.present
+                else None
             )
-            if reached_midpoint(
-                Assignment.model_validate(row.snapshot), submissions.get(row.id), now
-            )
-        ]
+            reason = _eligibility_rejection_reason(assignment, submission, now)
+            if reason is not None:
+                active_logger.debug(
+                    "[DEBUG] Atividade local=%s rejeitada; motivo=%s", row.id, reason
+                )
+                continue
+            eligible.append(row.id)
+        return eligible
 
 
 def _completed_solution(engine: Engine, assignment_id: int, digest: str) -> SolutionRecord | None:
@@ -201,9 +220,7 @@ def attach_solution(
     artifacts = _solution_artifacts(engine, solution_id)
     uploader = DriveUploader(engine, settings, drive.service)
     drive_ids = [
-        value
-        for artifact in artifacts
-        if (value := uploader.upload(artifact.id).drive_file_id)
+        value for artifact in artifacts if (value := uploader.upload(artifact.id).drive_file_id)
     ]
     existing = classroom.submission_material_ids(course_id, coursework_id, submission_id)
     pending = [value for value in drive_ids if value and value not in existing]
@@ -241,7 +258,7 @@ def run_cycle(
         counters["submissions"]["found"],
     )
     active_logger.info("Procurando atividades elegíveis")
-    result.eligible = eligible_assignment_ids(engine, current)
+    result.eligible = eligible_assignment_ids(engine, current, logger=active_logger)
     if not result.eligible:
         active_logger.info("Nenhuma atividade elegível encontrada")
     else:
@@ -401,8 +418,7 @@ def run_single_cycle(
             safe_error=_log_text(exc),
         )
         active_logger.error(
-            "Ciclo automático falhou; motivo=%s; duração=%.1fs; "
-            "nova_tentativa=próximo_horário",
+            "Ciclo automático falhou; motivo=%s; duração=%.1fs; nova_tentativa=próximo_horário",
             _log_text(exc),
             duration,
         )
@@ -418,8 +434,7 @@ def run_single_cycle(
             safe_error="erro local durante a operação",
         )
         active_logger.error(
-            "Ciclo automático falhou por erro local; duração=%.1fs; "
-            "nova_tentativa=próximo_horário",
+            "Ciclo automático falhou por erro local; duração=%.1fs; nova_tentativa=próximo_horário",
             duration,
         )
         return None
