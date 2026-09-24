@@ -30,6 +30,7 @@ class MockProvider(LLMProvider):
             assignment_types=context["assignment_types"],
             understanding="Contexto recebido para testar preparação e revisão humana.",
             answer="MOCK: configure o provider Astra para preparar uma resposta real.",
+            deliverable="",
             question_answers=[],
             artifacts=[],
             assumptions=[],

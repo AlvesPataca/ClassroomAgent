@@ -24,6 +24,8 @@ class Solution(StrictModel):
     assignment_types: Annotated[list[TaskType], Field(min_length=1, max_length=10)]
     understanding: Text
     answer: Text
+    # Final text for long-form deliverables. Empty for question-answer/code tasks.
+    deliverable: Annotated[str, Field(max_length=24000)]
     question_answers: Annotated[list[QuestionAnswer], Field(max_length=200)]
     artifacts: Annotated[list[ArtifactSpec], Field(max_length=20)]
     assumptions: Notes

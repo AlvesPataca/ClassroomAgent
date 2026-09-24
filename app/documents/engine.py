@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -57,6 +58,8 @@ FORMAT_ARTIFACT_TYPES = {
     OutputFormat.TXT: "TEXT",
     OutputFormat.MD: "MARKDOWN",
 }
+
+logger = logging.getLogger(__name__)
 
 
 TEXT_DELIVERABLES = {
@@ -365,6 +368,23 @@ def _document_sections(
         elif solution.get("answer"):
             sections.append((None, str(solution["answer"])))
         return sections
+
+    # New-format solutions explicitly separate final academic prose from internal
+    # understanding. An absent key identifies a persisted pre-change solution;
+    # keep its historical rendering because headings cannot safely be inferred.
+    if template == Template.ACADEMIC_REPORT and "deliverable" in solution:
+        deliverable = solution.get("deliverable")
+        return [(None, deliverable)] if isinstance(deliverable, str) and deliverable.strip() else []
+
+    if template == Template.CODE_ASSIGNMENT and "deliverable" in solution:
+        if solution.get("answer"):
+            sections.append((None, str(solution["answer"])))
+        for index, item in enumerate(items, 1):
+            label = str(item.get("question_id") or f"Questão {index}")
+            sections.append((f"{index}. {label}", str(item.get("answer", ""))))
+        _append_code_artifacts(sections, solution)
+        return sections
+
     if solution.get("understanding"):
         sections.append(("Entendimento", str(solution["understanding"])))
     if solution.get("answer"):
@@ -373,23 +393,39 @@ def _document_sections(
         label = str(item.get("question_id") or f"Questão {index}")
         sections.append((f"{index}. {label}", str(item.get("answer", ""))))
     if template == Template.CODE_ASSIGNMENT:
-        for spec in solution.get("artifacts", []):
-            if not isinstance(spec, dict):
-                continue
-            title = str(spec.get("title") or "Código")
-            if spec.get("kind") == "CODE" or "code" in title.lower():
-                source = str(spec.get("specification") or spec.get("content") or "")
-                fenced = re.fullmatch(
-                    r"(`{3,}|~{3,})[A-Za-z0-9_+.-]*[ \t]*\r?\n([\s\S]*?)\r?\n\1[ \t]*",
-                    source,
-                )
-                if fenced:
-                    source = fenced.group(2)
-                longest_ticks = max((len(run) for run in re.findall(r"`+", source)), default=2)
-                fence = "`" * max(3, longest_ticks + 1)
-                code = source + ("" if source.endswith("\n") else "\n")
-                sections.append((title, f"{fence}text\n{code}{fence}"))
+        _append_code_artifacts(sections, solution)
     return sections
+
+
+def _append_code_artifacts(
+    sections: list[tuple[str | None, str]], solution: dict[str, Any]
+) -> None:
+    for spec in solution.get("artifacts", []):
+        if not isinstance(spec, dict):
+            continue
+        title = str(spec.get("title") or "Código")
+        if spec.get("kind") == "CODE" or "code" in title.lower():
+            source = str(spec.get("specification") or spec.get("content") or "")
+            fenced = re.fullmatch(
+                r"(`{3,}|~{3,})[A-Za-z0-9_+.-]*[ \t]*\r?\n([\s\S]*?)\r?\n\1[ \t]*",
+                source,
+            )
+            if fenced:
+                source = fenced.group(2)
+            longest_ticks = max((len(run) for run in re.findall(r"`+", source)), default=2)
+            fence = "`" * max(3, longest_ticks + 1)
+            code = source + ("" if source.endswith("\n") else "\n")
+            sections.append((title, f"{fence}text\n{code}{fence}"))
+
+
+def _deliverable_strategy(template: Template, solution: dict[str, Any]) -> str:
+    if template == Template.ACADEMIC_REPORT:
+        if isinstance(solution.get("deliverable"), str) and solution["deliverable"].strip():
+            return "structured"
+        return "legacy_response" if "deliverable" not in solution else "empty"
+    if template == Template.QUESTION_ANSWER:
+        return "question_answers" if solution.get("question_answers") else "answer"
+    return "code_artifacts" if solution.get("artifacts") else "code_assignment"
 
 
 class DocumentBuilder:
@@ -458,6 +494,12 @@ class DocumentBuilder:
                 "question_answers": [],
             }
             template = self.choose_template(solution, override)
+            logger.debug(
+                "artifact=%s solution_version=%d deliverable_strategy=%s",
+                template.value.replace("-", "_"),
+                solution_row.version,
+                _deliverable_strategy(template, solution),
+            )
             current = select(func.max(GeneratedArtifact.version)).where(
                 GeneratedArtifact.assignment_id == assignment_id
             )

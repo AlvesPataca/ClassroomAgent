@@ -10,7 +10,9 @@ from typer.testing import CliRunner
 from app.cli.commands import app
 from app.documents.engine import DocumentBuilder, _deliverable_content, _deliverable_name
 from app.errors import AppError
+from app.llm.gemini import generation_schema
 from app.llm.providers import MockProvider
+from app.llm.schema import Solution
 from app.llm.service import solve_context
 from app.persistence.models import GeneratedArtifact, SolutionRecord
 from tests.test_phase4 import context_for  # noqa: F401
@@ -179,6 +181,7 @@ def test_code_assignment_removes_outer_fence_without_changing_code(phase4):
             "assignment_types": ["PROGRAMMING"],
             "understanding": "",
             "answer": "Código de exemplo.",
+            "deliverable": "",
             "question_answers": [],
             "artifacts": [
                 {
@@ -193,6 +196,213 @@ def test_code_assignment_removes_outer_fence_without_changing_code(phase4):
 
     assert "def main():" in text and "    print('ok')" in text
     assert "```" not in text
+    assert "Entendimento" not in text and "Resposta" not in text
+
+
+def test_academic_deliverable_excludes_internal_solution_fields_and_follows_task(phase4, caplog):
+    _, engine, builder = prepared_builder(phase4)
+    deliverable = """# Estudo de caso: infraestrutura para clínica regional
+
+Uma clínica com três unidades precisa manter prontuários disponíveis e proteger dados
+sensíveis. A proposta combina serviços de identidade, prontuário eletrônico, DNS,
+monitoramento e cópias de segurança.
+
+## Sistemas, usuários e equipamentos
+
+Recepcionistas consultam agendas; profissionais de saúde registram atendimentos; a equipe
+de TI administra contas e auditoria. Computadores gerenciados acessam os sistemas por uma
+rede segmentada, com Wi-Fi separado para visitantes.
+
+## Hospedagem, continuidade e virtualização
+
+O prontuário pode operar em nuvem privada gerenciada, enquanto integrações locais permanecem
+no datacenter da unidade principal. Máquinas virtuais isolam banco de dados, aplicação e
+monitoramento. Cópias criptografadas em região distinta e um procedimento de contingência
+permitem restaurar o serviço após falha.
+"""
+    with Session(engine) as session, session.begin():
+        row = session.query(SolutionRecord).one()
+        row.response = {
+            "assignment_types": ["RESEARCH"],
+            "understanding": "O enunciado solicita discutir infraestrutura. PLANEJAMENTO INTERNO.",
+            "answer": "PRÉVIA INTERNA: proposta para uma clínica.",
+            "deliverable": deliverable,
+            "question_answers": [],
+            "artifacts": [],
+        }
+    with caplog.at_level("DEBUG", logger="app.documents.engine"):
+        artifact = builder.build(1, override="academic-report", output_format="docx")
+    document = Document(artifact.local_path)
+    paragraphs = [paragraph.text for paragraph in document.paragraphs]
+    document_text = "\n".join(paragraphs)
+
+    assert any(
+        paragraph.text == "Estudo de caso: infraestrutura para clínica regional"
+        and paragraph.style.name == "Heading 1"
+        for paragraph in document.paragraphs
+    )
+    assert "Sistemas, usuários e equipamentos" in document_text
+    assert "Hospedagem, continuidade e virtualização" in document_text
+    assert "Entendimento" not in document_text and "Resposta" not in document_text
+    assert "O enunciado solicita" not in document_text
+    assert "PRÉVIA INTERNA" not in document_text and "PLANEJAMENTO INTERNO" not in document_text
+    record = next(record for record in caplog.records if "deliverable_strategy" in record.message)
+    assert "artifact=academic_report" in record.message
+    assert "solution_version=1" in record.message
+    assert "deliverable_strategy=structured" in record.message
+    assert "clínica" not in record.message and "Estudo de caso" not in record.message
+
+
+def test_academic_deliverable_keeps_explicit_analysis_heading(phase4):
+    _, engine, builder = prepared_builder(phase4)
+    with Session(engine) as session, session.begin():
+        row = session.query(SolutionRecord).one()
+        row.response = {
+            "assignment_types": ["LONG_FORM"],
+            "understanding": "Planejamento interno.",
+            "answer": "Prévia.",
+            "deliverable": "## Análise\n\nA atividade solicita uma seção com este título.",
+            "question_answers": [],
+            "artifacts": [],
+        }
+    artifact = builder.build(1, override="academic-report", output_format="txt")
+    text = Path(artifact.local_path).read_text(encoding="utf-8")
+
+    assert "Análise" in text and "A atividade solicita uma seção" in text
+    assert "Planejamento interno" not in text and "Prévia." not in text
+
+
+def test_academic_deliverable_can_number_ten_requested_items(phase4):
+    _, engine, builder = prepared_builder(phase4)
+    lines = "\n".join(f"{index}. Aspecto {index}" for index in range(1, 11))
+    with Session(engine) as session, session.begin():
+        row = session.query(SolutionRecord).one()
+        row.response = {
+            "assignment_types": ["LONG_FORM"],
+            "understanding": "Liste dez itens.",
+            "answer": "Prévia.",
+            "deliverable": lines,
+            "question_answers": [],
+            "artifacts": [],
+        }
+    artifact = builder.build(1, override="academic-report", output_format="txt")
+    text = Path(artifact.local_path).read_text(encoding="utf-8")
+
+    assert all(f"{index}. Aspecto {index}" in text for index in range(1, 11))
+    assert "Entendimento" not in text and "Liste dez itens" not in text
+
+
+def test_new_code_template_excludes_internal_understanding_and_keeps_source(phase4):
+    _, engine, builder = prepared_builder(phase4)
+    with Session(engine) as session, session.begin():
+        row = session.query(SolutionRecord).one()
+        row.response = {
+            "assignment_types": ["PROGRAMMING"],
+            "understanding": "Planejar a implementação.",
+            "answer": "A implementação usa uma função principal.",
+            "deliverable": "",
+            "question_answers": [],
+            "artifacts": [
+                {
+                    "kind": "CODE",
+                    "title": "main.py",
+                    "specification": "def main():\n    return 42\n",
+                }
+            ],
+        }
+    artifact = builder.build(1, override="code-assignment", output_format="txt")
+    text = Path(artifact.local_path).read_text(encoding="utf-8")
+
+    assert "def main():" in text and "    return 42" in text
+    assert "Planejar a implementação" not in text
+    assert "Resposta" not in text
+
+
+def test_legacy_solution_without_deliverable_still_generates_unchanged(phase4):
+    _, engine, builder = prepared_builder(phase4)
+    with Session(engine) as session, session.begin():
+        row = session.query(SolutionRecord).one()
+        row.response = {
+            "assignment_types": ["LONG_FORM"],
+            "understanding": "Interpretação antiga preservada.",
+            "answer": "Resposta antiga preservada.",
+            "question_answers": [],
+            "artifacts": [],
+        }
+    artifact = builder.build(1, override="academic-report", output_format="txt")
+    text = Path(artifact.local_path).read_text(encoding="utf-8")
+
+    assert "Entendimento" in text and "Interpretação antiga preservada" in text
+    assert "Resposta" in text and "Resposta antiga preservada" in text
+
+
+def test_new_academic_markdown_renders_in_pdf_and_docx_without_internal_text(phase4):
+    _, engine, builder = prepared_builder(phase4)
+    with Session(engine) as session, session.begin():
+        row = session.query(SolutionRecord).one()
+        row.response = {
+            "assignment_types": ["RESEARCH"],
+            "understanding": "INTERNO: O enunciado solicita um relatório.",
+            "answer": "PRÉVIA INTERNA.",
+            "deliverable": FORMAT_FIXTURE,
+            "question_answers": [],
+            "artifacts": [],
+        }
+    pdf = builder.build(1, override="academic-report", output_format="pdf")
+    docx = builder.build(1, override="academic-report", output_format="docx")
+    pdf_text = "\n".join(page.extract_text() or "" for page in PdfReader(pdf.local_path).pages)
+    docx_text = "\n".join(p.text for p in Document(docx.local_path).paragraphs)
+
+    for rendered in (pdf_text, docx_text):
+        assert "Principais componentes" in rendered
+        assert "servidor Linux" in rendered and "Olá, mundo" in rendered
+        assert "INTERNO" not in rendered and "PRÉVIA INTERNA" not in rendered
+        assert "Entendimento" not in rendered and "Resposta" not in rendered
+        assert "**" not in rendered and "```" not in rendered
+
+
+def test_question_answer_template_uses_question_pairs_not_deliverable():
+    from app.documents.engine import Template, _document_sections
+
+    sections = _document_sections(
+        Template.QUESTION_ANSWER,
+        {
+            "understanding": "Não incluir.",
+            "answer": "Fallback.",
+            "deliverable": "",
+            "question_answers": [
+                {"question_id": "A", "answer": "Resposta A."},
+                {"question_id": "B", "answer": "Resposta B."},
+            ],
+        },
+    )
+
+    assert sections == [("1. A", "Resposta A."), ("2. B", "Resposta B.")]
+
+
+def test_template_specific_prompts_define_deliverable_contract(phase4):
+    from app.llm.prompt import build_system_prompt
+
+    context = context_for(phase4)
+    academic = build_system_prompt(context.model_copy(update={"assignment_types": ["RESEARCH"]}))
+    questions = build_system_prompt(
+        context.model_copy(update={"assignment_types": ["SHORT_ANSWER"]})
+    )
+    code = build_system_prompt(context.model_copy(update={"assignment_types": ["PROGRAMMING"]}))
+
+    assert "FORMATO DE TRABALHO ACADÊMICO" in academic
+    assert "Não repita o enunciado" in academic and "deliverable" in academic
+    assert "FORMATO DE PERGUNTAS E RESPOSTAS" in questions
+    assert 'use deliverable=""' in questions
+    assert "FORMATO DE PROGRAMAÇÃO" in code
+    assert "Não altere o código" in code and 'deliverable=""' in code
+
+
+def test_deliverable_schema_is_required_simple_string_for_providers():
+    schema = generation_schema(Solution.model_json_schema())
+
+    assert schema["properties"]["deliverable"]["type"] == "string"
+    assert "deliverable" in schema["required"]
 
 
 @pytest.mark.parametrize("invalid", ["xyz", "../../arquivo", "/tmp/test.pdf", "foo/bar.docx"])

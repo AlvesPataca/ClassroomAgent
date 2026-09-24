@@ -10,7 +10,7 @@ from app.context.models import AssignmentContext
 from app.context.safety import sanitize
 from app.errors import AppError
 from app.llm.errors import MESSAGES, ProviderFailure
-from app.llm.prompt import SYSTEM_PROMPT, build_prompt
+from app.llm.prompt import build_prompt, build_system_prompt
 from app.llm.providers import LLMProvider
 from app.llm.schema import Solution
 from app.persistence.models import SolutionRecord
@@ -46,6 +46,14 @@ def validate_solution(raw: str, context: AssignmentContext) -> Solution:
         raise ValueError("Unknown or duplicate questions")
     if not result.requires_user_input and expected != set(supplied):
         raise ValueError("Missing answers")
+    task_types = set(context.assignment_types)
+    academic_report = "PROGRAMMING" not in task_types and bool(
+        task_types & {"LONG_FORM", "RESEARCH"}
+    )
+    if academic_report and not result.requires_user_input and not result.deliverable.strip():
+        raise ValueError("Missing academic deliverable")
+    if not academic_report and result.deliverable:
+        raise ValueError("Unexpected deliverable for specialized template")
     return result
 
 
@@ -77,7 +85,7 @@ def solve_context(
                 context_hash=context_hash(context),
                 created_at=now,
                 updated_at=now,
-                request_metadata={"schema_version": 5, "prompt_version": 2, "attempts": 0},
+                request_metadata={"schema_version": 6, "prompt_version": 3, "attempts": 0},
             )
             session.add(row)
             session.flush()
@@ -88,20 +96,20 @@ def solve_context(
     try:
         for attempt in range(2):
             attempts += 1
-            system = SYSTEM_PROMPT
+            system = build_system_prompt(context)
             if attempt:
                 # Controlled regeneration: don't echo hostile invalid output or validation values.
                 system += (
                     "\nA tentativa anterior falhou na validação. Gere novamente seguindo o schema."
                     " Use exatamente estas chaves obrigatórias: summary, assignment_types, "
-                    "understanding, answer, question_answers, artifacts, assumptions, "
+                    "understanding, answer, deliverable, question_answers, artifacts, assumptions, "
                     "uncertainties, sources_used, requires_user_input, warnings. "
                     "Para uma atividade sem questões, use question_answers=[]; "
                     "sources_used=[] é aceitável; não invente IDs. Retorne somente JSON."
                 )
-                valid_questions = [
-                    q.id for q in context.questions
-                ] + [q.id for form in context.forms for q in form.questions]
+                valid_questions = [q.id for q in context.questions] + [
+                    q.id for form in context.forms for q in form.questions
+                ]
                 system += (
                     "\nREGRAS EXATAS DE REPARO: question_answers só pode usar estes IDs: "
                     + repr(valid_questions)
