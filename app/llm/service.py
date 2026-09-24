@@ -46,11 +46,13 @@ def validate_solution(raw: str, context: AssignmentContext) -> Solution:
         raise ValueError("Unknown or duplicate questions")
     if not result.requires_user_input and expected != set(supplied):
         raise ValueError("Missing answers")
-    task_types = set(context.assignment_types)
+    # Match the same template source as DocumentBuilder, which classifies from
+    # the validated solution. Context classification can be UNKNOWN or disagree.
+    task_types = set(result.assignment_types)
     academic_report = "PROGRAMMING" not in task_types and bool(
         task_types & {"LONG_FORM", "RESEARCH"}
     )
-    if academic_report and not result.requires_user_input and not result.deliverable.strip():
+    if academic_report and not result.deliverable.strip():
         raise ValueError("Missing academic deliverable")
     if not academic_report and result.deliverable:
         raise ValueError("Unexpected deliverable for specialized template")

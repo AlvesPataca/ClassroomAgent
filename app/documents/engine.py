@@ -374,7 +374,9 @@ def _document_sections(
     # keep its historical rendering because headings cannot safely be inferred.
     if template == Template.ACADEMIC_REPORT and "deliverable" in solution:
         deliverable = solution.get("deliverable")
-        return [(None, deliverable)] if isinstance(deliverable, str) and deliverable.strip() else []
+        if not isinstance(deliverable, str) or not deliverable.strip():
+            raise AppError("Solução acadêmica sem deliverable; artifact não pode ser gerado.")
+        return [(None, deliverable)]
 
     if template == Template.CODE_ASSIGNMENT and "deliverable" in solution:
         if solution.get("answer"):
@@ -494,12 +496,41 @@ class DocumentBuilder:
                 "question_answers": [],
             }
             template = self.choose_template(solution, override)
+            request_metadata = solution_row.request_metadata or {}
+            stored_schema = (
+                request_metadata.get("schema_version")
+                if isinstance(request_metadata, dict)
+                else None
+            )
+            answer = solution.get("answer")
+            deliverable = solution.get("deliverable")
+            answer_present = isinstance(answer, str) and bool(answer.strip())
+            deliverable_present = isinstance(deliverable, str) and bool(deliverable.strip())
             logger.debug(
-                "artifact=%s solution_version=%d deliverable_strategy=%s",
-                template.value.replace("-", "_"),
+                "solution_version=%d template=%s request_schema_version=%s "
+                "answer_present=%s answer_length=%d deliverable_present=%s "
+                "deliverable_length=%d deliverable_strategy=%s",
                 solution_row.version,
+                template.value.replace("-", "_"),
+                stored_schema if isinstance(stored_schema, int) else "unknown",
+                answer_present,
+                len(answer) if isinstance(answer, str) else 0,
+                deliverable_present,
+                len(deliverable) if isinstance(deliverable, str) else 0,
                 _deliverable_strategy(template, solution),
             )
+            if template == Template.ACADEMIC_REPORT:
+                # Only an explicitly older solution schema may use the historical
+                # answer/understanding layout. Unknown/new schemas fail closed.
+                legacy_solution = isinstance(stored_schema, int) and stored_schema < 6
+                if not deliverable_present and not legacy_solution:
+                    raise AppError(
+                        "Solução acadêmica nova sem deliverable; nenhum artifact foi gerado. "
+                        "Revise a solution ou gere uma nova versão."
+                    )
+                if not deliverable_present:
+                    solution = dict(solution)
+                    solution.pop("deliverable", None)
             current = select(func.max(GeneratedArtifact.version)).where(
                 GeneratedArtifact.assignment_id == assignment_id
             )

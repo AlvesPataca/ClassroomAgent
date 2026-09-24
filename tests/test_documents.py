@@ -13,7 +13,7 @@ from app.errors import AppError
 from app.llm.gemini import generation_schema
 from app.llm.providers import MockProvider
 from app.llm.schema import Solution
-from app.llm.service import solve_context
+from app.llm.service import solve_context, validate_solution
 from app.persistence.models import GeneratedArtifact, SolutionRecord
 from tests.test_phase4 import context_for  # noqa: F401
 from tests.test_phase4 import phase4 as phase4
@@ -55,6 +55,7 @@ def prepared_builder(phase4):
             "question_answers": [],
             "artifacts": [],
         }
+        row.request_metadata = {"schema_version": 5, "prompt_version": 2}
     configured = settings.model_copy(
         update={"generated_root": settings.database_file.parent / "format-output"}
     )
@@ -247,9 +248,13 @@ permitem restaurar o serviço após falha.
     assert "O enunciado solicita" not in document_text
     assert "PRÉVIA INTERNA" not in document_text and "PLANEJAMENTO INTERNO" not in document_text
     record = next(record for record in caplog.records if "deliverable_strategy" in record.message)
-    assert "artifact=academic_report" in record.message
+    assert "template=academic_report" in record.message
     assert "solution_version=1" in record.message
     assert "deliverable_strategy=structured" in record.message
+    assert "answer_present=True" in record.message
+    assert f"answer_length={len('PRÉVIA INTERNA: proposta para uma clínica.')}" in record.message
+    assert "deliverable_present=True" in record.message
+    assert f"deliverable_length={len(deliverable)}" in record.message
     assert "clínica" not in record.message and "Estudo de caso" not in record.message
 
 
@@ -329,11 +334,90 @@ def test_legacy_solution_without_deliverable_still_generates_unchanged(phase4):
             "question_answers": [],
             "artifacts": [],
         }
+        row.request_metadata = {"schema_version": 5, "prompt_version": 2}
     artifact = builder.build(1, override="academic-report", output_format="txt")
     text = Path(artifact.local_path).read_text(encoding="utf-8")
 
     assert "Entendimento" in text and "Interpretação antiga preservada" in text
     assert "Resposta" in text and "Resposta antiga preservada" in text
+
+
+def test_new_solution_deliverable_survives_parse_sqlite_reload_and_docx(phase4):
+    from app.persistence.database import open_database
+
+    settings, engine, _ = prepared_builder(phase4)
+    context = context_for(phase4).model_copy(update={"assignment_types": ["RESEARCH"]})
+    parsed = validate_solution(
+        Solution(
+            summary="Proposta de infraestrutura para uma clínica regional.",
+            assignment_types=["RESEARCH"],
+            understanding="Análise interna do cenário e dos requisitos.",
+            answer="Prévia interna do trabalho final.",
+            deliverable=(
+                "# Infraestrutura para clínica regional\n\n"
+                "A arquitetura integra prontuário eletrônico, identidade, DNS e monitoramento.\n\n"
+                "## Continuidade\n\n"
+                "Cópias criptografadas em região distinta permitem restaurar o serviço.\n"
+            ),
+            question_answers=[],
+            artifacts=[],
+            assumptions=[],
+            uncertainties=[],
+            sources_used=[],
+            requires_user_input=True,
+            warnings=[],
+        ).model_dump_json(),
+        context,
+    )
+    expected = parsed.deliverable
+    with Session(engine) as session, session.begin():
+        row = session.query(SolutionRecord).one()
+        row.version = 5
+        row.request_metadata = {"schema_version": 6, "prompt_version": 3}
+        row.response = parsed.model_dump()
+        row.answer = parsed.answer
+
+    engine.dispose()
+    reloaded_engine = open_database(settings.database_file)
+    try:
+        with Session(reloaded_engine) as session:
+            reloaded = session.query(SolutionRecord).filter_by(assignment_id=1, version=5).one()
+            assert reloaded.response is not None
+            assert reloaded.response["deliverable"] == expected
+            assert reloaded.response["answer"] == parsed.answer
+        builder = DocumentBuilder(reloaded_engine, settings)
+        artifact = builder.build(
+            1, solution_version=5, override="academic-report", output_format="docx"
+        )
+        text = "\n".join(p.text for p in Document(artifact.local_path).paragraphs)
+        assert "A arquitetura integra prontuário eletrônico" in text
+        assert "Continuidade" in text and "restaurar o serviço" in text
+        assert "Análise interna" not in text and "Prévia interna" not in text
+    finally:
+        reloaded_engine.dispose()
+
+
+@pytest.mark.parametrize("deliverable_state", ["absent", "empty"])
+def test_new_academic_solution_without_deliverable_fails_before_artifact(phase4, deliverable_state):
+    _, engine, builder = prepared_builder(phase4)
+    response = {
+        "assignment_types": ["RESEARCH"],
+        "understanding": "Planejamento interno.",
+        "answer": "Texto preenchido no campo answer.",
+        "question_answers": [],
+        "artifacts": [],
+    }
+    if deliverable_state == "empty":
+        response["deliverable"] = ""
+    with Session(engine) as session, session.begin():
+        row = session.query(SolutionRecord).one()
+        row.response = response
+        row.request_metadata = {"schema_version": 6, "prompt_version": 3}
+
+    with pytest.raises(AppError, match="sem deliverable; nenhum artifact foi gerado"):
+        builder.build(1, solution_version=1, override="academic-report", output_format="docx")
+    with Session(engine) as session:
+        assert session.query(GeneratedArtifact).count() == 0
 
 
 def test_new_academic_markdown_renders_in_pdf_and_docx_without_internal_text(phase4):
@@ -405,6 +489,28 @@ def test_deliverable_schema_is_required_simple_string_for_providers():
     assert "deliverable" in schema["required"]
 
 
+@pytest.mark.parametrize("requires_user_input", [False, True])
+def test_solution_validation_uses_response_template_for_deliverable(phase4, requires_user_input):
+    context = context_for(phase4)  # Its classifier returns UNKNOWN for this fixture.
+    response = Solution(
+        summary="Resumo.",
+        assignment_types=["RESEARCH"],
+        understanding="Interpretação interna.",
+        answer="O texto acadêmico completo está no campo legado answer.",
+        deliverable="",
+        question_answers=[],
+        artifacts=[],
+        assumptions=[],
+        uncertainties=[],
+        sources_used=[],
+        requires_user_input=requires_user_input,
+        warnings=[],
+    )
+
+    with pytest.raises(ValueError, match="Missing academic deliverable"):
+        validate_solution(response.model_dump_json(), context)
+
+
 @pytest.mark.parametrize("invalid", ["xyz", "../../arquivo", "/tmp/test.pdf", "foo/bar.docx"])
 def test_format_rejects_unknown_values_and_paths(phase4, invalid):
     _, _, builder = prepared_builder(phase4)
@@ -425,6 +531,7 @@ def test_cli_template_and_format_are_independent_and_legacy_defaults_to_pdf(phas
             "question_answers": [],
             "artifacts": [],
         }
+        row.request_metadata = {"schema_version": 5, "prompt_version": 2}
     settings = settings.model_copy(
         update={"generated_root": settings.database_file.parent / "format-cli"}
     )
