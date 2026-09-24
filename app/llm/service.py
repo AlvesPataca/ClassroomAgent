@@ -236,10 +236,15 @@ def solve_context(
     attempts = 0
     validation_reasons: list[str] = []
     repair_candidate: dict[str, Any] | None = None
+    repair_attempted = False
+    repair_status = "not_attempted"
+    repair_valid: bool | None = None
     try:
         for attempt in range(2):
             attempts += 1
             if attempt:
+                repair_attempted = True
+                repair_status = "running"
                 candidate_types = _candidate_types(repair_candidate)
                 system = build_repair_system_prompt(
                     context, validation_reasons[-1], candidate_types
@@ -250,15 +255,39 @@ def solve_context(
             raw = provider.generate(system, data, Solution.model_json_schema())
             try:
                 solution = validate_solution(raw, context)
+                if attempt:
+                    repair_status = "succeeded"
+                    repair_valid = True
+                stats = _validation_fields(raw, context)
+                logger.info(
+                    "event=solution_validation validation_status=valid solution_version=%d "
+                    "template=%s schema_version=%d validation_reason=none blocking=false "
+                    "answer_present=%s answer_length=%d deliverable_present=%s "
+                    "deliverable_length=%d repair_attempted=%s repair_status=%s repair_valid=%s",
+                    version,
+                    stats["template"],
+                    SOLUTION_SCHEMA_VERSION,
+                    stats["answer_present"],
+                    stats["answer_length"],
+                    stats["deliverable_present"],
+                    stats["deliverable_length"],
+                    repair_attempted,
+                    repair_status,
+                    repair_valid,
+                )
                 break
             except SolutionValidationError as exc:
                 validation_reasons.append(exc.reason)
+                if attempt:
+                    repair_status = "invalid"
+                    repair_valid = False
                 stats = _validation_fields(raw, context)
                 logger.warning(
-                    "solution_validation solution_version=%d template=%s schema_version=%d "
-                    "validation_reason=%s answer_present=%s answer_length=%d "
-                    "deliverable_present=%s deliverable_length=%d repair_attempted=%s "
-                    "repair_valid=false",
+                    "event=%s validation_status=failed solution_version=%d template=%s "
+                    "schema_version=%d validation_reason=%s blocking=true answer_present=%s "
+                    "answer_length=%d deliverable_present=%s deliverable_length=%d "
+                    "repair_attempted=%s repair_status=%s next_action=%s",
+                    "repair_validation" if attempt else "solution_validation",
                     version,
                     stats["template"],
                     SOLUTION_SCHEMA_VERSION,
@@ -267,28 +296,14 @@ def solve_context(
                     stats["answer_length"],
                     stats["deliverable_present"],
                     stats["deliverable_length"],
-                    attempt > 0,
+                    repair_attempted,
+                    repair_status if attempt else "scheduled",
+                    "fail" if attempt else "repair",
                 )
                 if attempt:
                     raise ProviderFailure("VALIDATION", validation_reason=exc.reason) from None
                 repair_candidate = _safe_repair_candidate(raw)
                 continue
-            stats = _validation_fields(raw, context)
-            logger.info(
-                "solution_validation solution_version=%d template=%s schema_version=%d "
-                "validation_reason=none answer_present=%s answer_length=%d "
-                "deliverable_present=%s deliverable_length=%d repair_attempted=%s "
-                "repair_valid=%s",
-                version,
-                stats["template"],
-                SOLUTION_SCHEMA_VERSION,
-                stats["answer_present"],
-                stats["answer_length"],
-                stats["deliverable_present"],
-                stats["deliverable_length"],
-                attempt > 0,
-                attempt > 0,
-            )
         if solution is None:
             raise AppError("Nenhuma solução válida.")
     except Exception as exc:
@@ -297,6 +312,23 @@ def solve_context(
         validation_reason = exc.validation_reason if isinstance(exc, ProviderFailure) else None
         if validation_reason:
             message = f"Resposta inválida após reparo: {validation_reason}."
+        if repair_attempted and repair_status == "running":
+            repair_status = "error"
+        final_validation_status = "failed" if repair_status == "invalid" else "not_completed"
+        logger.error(
+            "event=solution_completion solution_status=FAILED solution_version=%d "
+            "attempts=%d validation_status=%s validation_reason=%s repair_attempted=%s "
+            "repair_status=%s repair_valid=%s validation_reasons=%s provider_error_code=%s",
+            version,
+            attempts,
+            final_validation_status,
+            validation_reasons[-1] if validation_reasons else "none",
+            repair_attempted,
+            repair_status,
+            repair_valid,
+            ",".join(validation_reasons) or "none",
+            code,
+        )
         # Failure bodies and exception messages can contain keys or hostile content.
         with Session(engine) as session, session.begin():
             failed = session.get(SolutionRecord, row_id)
@@ -308,11 +340,14 @@ def solve_context(
             failed.request_metadata = {
                 **failed.request_metadata,
                 "attempts": attempts,
+                "validation_status": final_validation_status,
+                "validation_reason": validation_reasons[-1] if validation_reasons else None,
                 **(
                     {
                         "validation_reasons": validation_reasons,
-                        "repair_attempted": attempts > 1,
-                        "repair_valid": False,
+                        "repair_attempted": repair_attempted,
+                        "repair_status": repair_status,
+                        "repair_valid": repair_valid,
                     }
                     if validation_reasons
                     else {}
@@ -330,10 +365,23 @@ def solve_context(
         saved.request_metadata = {
             **saved.request_metadata,
             "attempts": attempts,
+            "validation_status": "valid",
+            "validation_reason": "none",
             "validation_reasons": validation_reasons,
-            "repair_attempted": attempts > 1,
-            "repair_valid": True if attempts > 1 else None,
+            "repair_attempted": repair_attempted,
+            "repair_status": repair_status,
+            "repair_valid": repair_valid,
         }
+        logger.info(
+            "event=solution_completion solution_status=NEEDS_REVIEW validation_status=valid "
+            "validation_reason=none solution_version=%d repair_attempted=%s "
+            "repair_status=%s repair_valid=%s validation_reasons=%s",
+            version,
+            repair_attempted,
+            repair_status,
+            repair_valid,
+            ",".join(validation_reasons) or "none",
+        )
         return saved
 
 

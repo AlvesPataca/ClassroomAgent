@@ -83,6 +83,7 @@ def test_repair_uses_academic_template_and_preserves_candidate_content(phase4):
     assert saved.status == "NEEDS_REVIEW"
     assert saved.request_metadata["validation_reasons"] == ["missing_deliverable"]
     assert saved.request_metadata["repair_attempted"] is True
+    assert saved.request_metadata["repair_status"] == "succeeded"
     assert saved.request_metadata["repair_valid"] is True
     repair_system, repair_data, _ = provider.calls[1]
     assert "FORMATO DE TRABALHO ACADÊMICO" in repair_system
@@ -94,7 +95,9 @@ def test_repair_uses_academic_template_and_preserves_candidate_content(phase4):
     assert settings.database_file.exists()
 
 
-def test_repair_still_missing_deliverable_fails_with_specific_reason_and_no_artifact(phase4):
+def test_repair_still_missing_deliverable_fails_with_specific_reason_and_no_artifact(
+    phase4, caplog
+):
     _, engine, _ = phase4
     context = context_for(phase4)
     first = solution_data()
@@ -102,19 +105,27 @@ def test_repair_still_missing_deliverable_fails_with_specific_reason_and_no_arti
     second = solution_data(deliverable="")
     provider = ScriptedProvider([json.dumps(first), json.dumps(second)])
 
-    with pytest.raises(AppError, match="empty_deliverable"):
-        solve_context(engine, context, provider)
+    with caplog.at_level("INFO", logger="app.llm.service"):
+        with pytest.raises(AppError, match="empty_deliverable"):
+            solve_context(engine, context, provider)
     with Session(engine) as session:
         failed = session.scalar(select(SolutionRecord))
         assert failed is not None
         assert failed.status == "FAILED"
         assert failed.error == "Resposta inválida após reparo: empty_deliverable."
+        assert failed.request_metadata["validation_status"] == "failed"
+        assert failed.request_metadata["validation_reason"] == "empty_deliverable"
         assert failed.request_metadata["validation_reasons"] == [
             "missing_deliverable",
             "empty_deliverable",
         ]
+        assert failed.request_metadata["repair_attempted"] is True
+        assert failed.request_metadata["repair_status"] == "invalid"
         assert failed.request_metadata["repair_valid"] is False
         assert session.scalar(select(func.count()).select_from(GeneratedArtifact)) == 0
+    assert "event=repair_validation validation_status=failed" in caplog.text
+    assert "event=solution_completion solution_status=FAILED" in caplog.text
+    assert "repair_status=invalid repair_valid=False" in caplog.text
 
 
 def test_invalid_json_is_repaired_and_logged_without_content(phase4, caplog):
@@ -133,8 +144,92 @@ def test_invalid_json_is_repaired_and_logged_without_content(phase4, caplog):
     assert "prompt" not in caplog.text.lower()
 
 
+def test_invalid_optional_source_is_repaired_and_solution_accepted(phase4, caplog):
+    _, engine, _ = phase4
+    context = context_for(phase4).model_copy(
+        update={"provenance": {"assignment.description": "UNTRUSTED_DATA"}}
+    )
+    invalid_first_attempt = solution_data(sources_used=["unknown.source"])
+    repaired = solution_data(sources_used=["assignment.description"])
+    provider = ScriptedProvider([json.dumps(invalid_first_attempt), json.dumps(repaired)])
+
+    with caplog.at_level("INFO", logger="app.llm.service"):
+        saved = solve_context(engine, context, provider)
+
+    assert saved.status == "NEEDS_REVIEW"
+    assert saved.request_metadata["validation_status"] == "valid"
+    assert saved.request_metadata["validation_reason"] == "none"
+    assert saved.request_metadata["validation_reasons"] == ["invalid_sources"]
+    assert saved.request_metadata["repair_attempted"] is True
+    assert saved.request_metadata["repair_status"] == "succeeded"
+    assert saved.request_metadata["repair_valid"] is True
+    assert "validation_reason=invalid_sources blocking=true" in caplog.text
+    assert "event=solution_validation validation_status=valid" in caplog.text
+    assert "event=solution_completion solution_status=NEEDS_REVIEW" in caplog.text
+    assert "repair_status=succeeded repair_valid=True" in caplog.text
+
+
+def test_first_attempt_valid_has_no_repair_and_unambiguous_logs(phase4, caplog):
+    _, engine, _ = phase4
+    provider = ScriptedProvider([json.dumps(solution_data())])
+
+    with caplog.at_level("INFO", logger="app.llm.service"):
+        saved = solve_context(engine, context_for(phase4), provider)
+
+    assert saved.status == "NEEDS_REVIEW"
+    assert saved.request_metadata["validation_status"] == "valid"
+    assert saved.request_metadata["validation_reason"] == "none"
+    assert saved.request_metadata["repair_attempted"] is False
+    assert saved.request_metadata["repair_status"] == "not_attempted"
+    assert saved.request_metadata["repair_valid"] is None
+    assert "validation_status=valid" in caplog.text
+    assert "blocking=false" in caplog.text
+    assert "repair_status=not_attempted repair_valid=None" in caplog.text
+    assert "solution_status=NEEDS_REVIEW" in caplog.text
+
+
+def test_provider_error_during_repair_is_not_reported_as_invalid_repair(phase4, caplog):
+    _, engine, _ = phase4
+    context = context_for(phase4)
+    invalid = solution_data()
+    del invalid["deliverable"]
+
+    class RepairProvider(ScriptedProvider):
+        def generate(self, system, data, schema):
+            self.calls.append((system, data, schema))
+            if len(self.calls) == 2:
+                raise RuntimeError("local fake provider failure")
+            return json.dumps(invalid)
+
+    with caplog.at_level("INFO", logger="app.llm.service"):
+        with pytest.raises(AppError, match="Falha de geração/validação não classificada"):
+            solve_context(engine, context, RepairProvider([]))
+
+    with Session(engine) as session:
+        failed = session.scalar(select(SolutionRecord))
+        assert failed is not None
+        assert failed.status == "FAILED"
+        assert failed.request_metadata["validation_status"] == "not_completed"
+        assert failed.request_metadata["repair_attempted"] is True
+        assert failed.request_metadata["repair_status"] == "error"
+        assert failed.request_metadata["repair_valid"] is None
+    assert "solution_status=FAILED" in caplog.text
+    assert "repair_status=error repair_valid=None" in caplog.text
+
+
 def test_sources_and_questions_get_specific_reasons(phase4):
     context = context_for(phase4)
+    # Empty sources are optional; supplied identifiers must be in provenance.
+    empty_sources = validate_solution(json.dumps(solution_data(sources_used=[])), context)
+    source_context = context.model_copy(
+        update={"provenance": {"assignment.description": "UNTRUSTED_DATA"}}
+    )
+    valid_sources = validate_solution(
+        json.dumps(solution_data(sources_used=["assignment.description"])), source_context
+    )
+    assert empty_sources.sources_used == []
+    assert valid_sources.sources_used == ["assignment.description"]
+
     with pytest.raises(SolutionValidationError) as source_error:
         validate_solution(json.dumps(solution_data(sources_used=["not-in-provenance"])), context)
     assert source_error.value.reason == "invalid_sources"
