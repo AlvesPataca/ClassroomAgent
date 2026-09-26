@@ -48,6 +48,9 @@ def test_status_has_stable_empty_shape(tmp_path):
         "generated": 0,
         "errors": 0,
         "duration_seconds": None,
+        "version": APP_VERSION,
+        "turn_in_enabled": False,
+        "last_cycle_result": None,
     }
 
 
@@ -122,4 +125,27 @@ def test_manual_run_returns_immediately_off_thread_and_rejects_concurrency(tmp_p
 
     assert first.json()["status"] == "accepted"
     assert second.status_code == 409
-    assert second.json() == {"detail": "A cycle is already running"}
+    assert second.json()["detail"] == "A cycle is already running"
+    assert second.json()["error"]["code"] == "cycle_running"
+
+
+def test_thread_start_failure_releases_shared_lock(tmp_path):
+    from app.cycle_lock import CycleLock
+
+    settings = api_settings(tmp_path)
+    with TestClient(create_app(settings), raise_server_exceptions=False) as client:
+        with patch("app.api.Thread", side_effect=RuntimeError("cannot start")):
+            assert client.post("/api/v1/run").status_code == 500
+    lock = CycleLock(settings.cycle_lock_file)
+    assert lock.acquire()
+    lock.release()
+
+
+def test_run_respects_external_process_lock(tmp_path):
+    from app.cycle_lock import CycleLock
+
+    settings = api_settings(tmp_path)
+    with CycleLock(settings.cycle_lock_file):
+        with patch("app.api.run_single_cycle") as run, TestClient(create_app(settings)) as client:
+            assert client.post("/api/v1/run").status_code == 409
+            run.assert_not_called()

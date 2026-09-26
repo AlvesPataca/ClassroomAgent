@@ -223,12 +223,13 @@ def status_snapshot(
         }
 
 
-def cycle_history(engine: Engine, limit: int) -> list[dict[str, Any]]:
+def cycle_history(engine: Engine, limit: int, offset: int = 0) -> list[dict[str, Any]]:
     with Session(engine) as session:
         rows = session.scalars(
             select(AutomationCycleRecord)
             .where(AutomationCycleRecord.status != "RUNNING")
-            .order_by(desc(AutomationCycleRecord.started_at))
+            .order_by(desc(AutomationCycleRecord.started_at), desc(AutomationCycleRecord.id))
+            .offset(offset)
             .limit(limit)
         )
         return [

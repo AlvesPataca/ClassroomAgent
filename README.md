@@ -198,7 +198,7 @@ sudo journalctl -u classroom-agent.service -f
 Os logs registram somente metadados operacionais. Chaves de API, tokens OAuth, arquivos de
 credenciais e o conteúdo das respostas não são registrados.
 
-## API privada de monitoramento
+## Management Platform — Fase 1: API privada read-only + run now
 
 A API é um processo separado e usa o mesmo SQLite e o mesmo executor de ciclo do agente. Ela não
 consulta o Google nos endpoints de leitura. O prefixo `/api/v1` mantém o contrato preparado para
@@ -207,9 +207,18 @@ evoluções do aplicativo Android.
 ```text
 GET  /api/v1/health
 GET  /api/v1/status
-GET  /api/v1/history?limit=20
+GET  /api/v1/history?limit=20&offset=0
 GET  /api/v1/activities?limit=20
 POST /api/v1/run
+GET  /api/v1/assignments?limit=20&offset=0&course_id=1&status=NEW
+GET  /api/v1/assignments/{assignment_id}
+GET  /api/v1/assignments/{assignment_id}/solutions
+GET  /api/v1/solutions/{solution_id}
+GET  /api/v1/solutions/{solution_id}/artifacts
+GET  /api/v1/artifacts/{artifact_id}
+GET  /api/v1/artifacts/{artifact_id}/content
+GET  /api/v1/settings
+GET  /openapi.json
 ```
 
 `limit` aceita valores de 1 a 100. `POST /api/v1/run` retorna `202` e inicia o mesmo ciclo usado
@@ -217,6 +226,118 @@ por `run --once` em uma thread de trabalho. Se o agente ou outra solicitação j
 um ciclo, retorna `409`. Um lock de arquivo do sistema operacional coordena os dois processos e é
 liberado automaticamente se o processo terminar. Nenhum endpoint executa comandos arbitrários ou
 faz `turnIn`.
+
+O Core V1 permanece congelado. Os serviços `classroom-agent.service` (scheduler) e
+`classroom-agent-api.service` (HTTP) continuam independentes. Todos os GETs usam dados locais;
+nenhum GET sincroniza, resolve, gera documentos ou consulta Google/LLM. Somente `/run` pode
+iniciar o pipeline existente, que pode sincronizar, gerar e enviar rascunhos conforme suas regras.
+A revisão humana e o turn-in automático desativado continuam preservados.
+
+Não há autenticação própria nesta fase: a fronteira de acesso é a tailnet/Tailscale Serve.
+Quem recebe acesso à API pode ler enunciados, soluções e documentos acadêmicos e solicitar ciclos;
+restrinja os membros autorizados na tailnet. Não abrir porta pública, não usar `0.0.0.0`, Funnel
+ou Cloudflare. Swagger/ReDoc permanecem desativados; `/openapi.json` está disponível na rede privada
+para conferir ou gerar modelos Kotlin. Nenhum código Android ou endpoint futuro foi criado.
+
+Contrato e compatibilidade:
+
+- IDs são inteiros locais positivos. Listagens retornam arrays. `limit` vai de 1 a 100;
+  `offset` é não negativo e existe em history e assignments. Página vazia indica fim.
+- `/activities` mantém seu significado de atividades recentes dos ciclos. `/assignments` lista
+  todas as atividades persistidas, incluindo as sem ciclo/solution. Ordenação estável: presentes
+  primeiro, depois ID decrescente. `course_id` é local e `status` filtra o estado de submissão
+  persistido (`NEW`, `TURNED_IN` etc.), não o campo `status` normalizado (`PENDING`, `MISSING` etc.).
+- Atraso, status normalizado e elegibilidade reutilizam funções do core sobre snapshots locais.
+  Esses valores refletem o último sync e o relógio atual, não uma consulta ao Classroom.
+- Detalhes incluem enunciado completo e metadados selecionados de attachments, sem arquivos
+  baixados, URLs arbitrárias, payloads brutos ou dados de extração.
+- Solutions vêm por versão decrescente; listas não carregam o texto de resposta. O DTO de revisão
+  usa `review_kind`: `deliverable` para relatório acadêmico, `question_answer` para respostas
+  curtas, `code` para arquivos e `unavailable` quando não existe conteúdo revisável seguro.
+  Relatórios antigos sem deliverable não usam `answer` como fallback. Nas respostas curtas,
+  `answer` e `question_answers` são explícitos; código usa `files`. Nunca são retornados
+  understanding, prompts, reasoning, request_metadata ou resposta bruta do provider.
+- Datas novas são ISO 8601 com timezone; UTC pode aparecer como `Z`. Datas legadas preservam
+  sua representação com offset. Campos ausentes são `null`, não strings vazias.
+- `/status` preserva campos anteriores e acrescenta `version`, `turn_in_enabled=false` e
+  `last_cycle_result`. `next_cycle=null` significa que não há próxima execução registrada;
+  a API não inventa um agendamento quando o scheduler está parado.
+- Erros 404/409/422/500 usam `{"detail":"...","error":{"code":"...","message":"..."}}`.
+  O `detail` de conflito 409 foi preservado. Validação 422 agora omite inputs e detalhes internos.
+  Respostas de Range inválido são as respostas nativas de Starlette (416/400).
+- Settings usa uma lista explícita de campos operacionais. Presença de token/credenciais não
+  prova sessão Google válida: `google_authentication_status="not_verified"`. Nenhum token é lido
+  ou atualizado pelo endpoint. `drive_folder_configured` indica configuração local, não saúde
+  da integração. O intervalo mostrado é o da configuração carregada pelo processo da API;
+  os dois serviços devem usar a mesma configuração.
+
+Artifacts:
+
+- O cliente fornece somente ID. O servidor resolve o registro, canonicaliza o caminho e exige
+  arquivo regular dentro de `generated_root`, inclusive após resolver links simbólicos.
+- Caminhos externos, arquivos ausentes, dotfiles e arquivos configurados de credenciais, token
+  e banco não são servidos. Apenas artifacts READY/UPLOAD_PENDING/UPLOADED têm conteúdo disponível.
+  Não existe endpoint genérico de filesystem, nem argumento de caminho para download.
+- O nome de download é sintético (`artifact-ID.ext`), sem caminho absoluto ou nome interno.
+  Metadados incluem tamanho quando o arquivo existe, versão da solution, versão do artifact,
+  formato, estado e Drive file ID; nunca contêm path absoluto.
+- PDF usa `application/pdf` e disposição inline; DOCX usa seu MIME oficial e attachment.
+  TXT/Markdown e formatos textuais registrados usam MIME correspondente e attachment.
+  `nosniff`, CSP sandbox e cache privado sem armazenamento acompanham os downloads.
+- `FileResponse` fornece streaming e HTTP Range nativos: PDF parcial retorna 206 e Content-Range;
+  intervalo fora do arquivo retorna 416. Não há implementação própria de streaming.
+- A pasta de saída e o banco devem continuar graváveis somente pelos processos locais confiáveis.
+  A API não aceita operações de escrita nesses arquivos. Arquivo ausente retorna 404 sem revelar path.
+
+Os DTOs Pydantic ficam em `app/api_schemas.py`; a projeção de persistência para esses DTOs fica
+em `app/management_api.py`. O Android só depende do contrato OpenAPI. Consultas de listas usam
+joins/subconsultas agregadas e projeções JSON para evitar N+1 e carregar conteúdo de soluções.
+O `busy_timeout=30000` existente foi preservado; WAL não foi ativado. Nenhuma migração ou
+biblioteca nova foi instalada. Starlette, já transitiva do FastAPI, agora tem requisito explícito
+`>=1.6,<2`, correspondente à versão validada para FileResponse/Range; instalações antigas devem
+atualizar as dependências antes de usar este contrato. Testes usam SQLite temporário, fakes e bloqueio de rede externa
+(loopback é permitido para os socket pairs internos do asyncio no Windows).
+
+Exemplos sem dados pessoais (troque o endereço local pelo endereço privado do Serve no cliente):
+
+```bash
+curl 'http://127.0.0.1:8765/api/v1/assignments?limit=20&offset=0'
+curl http://127.0.0.1:8765/api/v1/solutions/1
+curl http://127.0.0.1:8765/api/v1/settings
+curl -X POST http://127.0.0.1:8765/api/v1/run
+curl -o revisao.pdf http://127.0.0.1:8765/api/v1/artifacts/1/content
+curl -H 'Range: bytes=0-1023' http://127.0.0.1:8765/api/v1/artifacts/1/content
+```
+
+Exemplo de revisão acadêmica:
+
+```json
+{
+  "id": 1, "assignment_id": 1, "version": 2, "status": "READY",
+  "template": "academic-report", "provider": "mock", "model": "mock",
+  "created_at": "2026-09-25T12:00:00Z", "updated_at": "2026-09-25T12:00:00Z",
+  "has_deliverable": true, "artifact_count": 1, "review_kind": "deliverable",
+  "deliverable": "# Relatório\nTexto final para revisão.", "answer": null,
+  "question_answers": [], "files": []
+}
+```
+
+Exemplo de artifact:
+
+```json
+{
+  "id": 1, "solution_id": 1, "solution_version": 2, "version": 1,
+  "format": "PDF", "name": "artifact-1.pdf", "size_bytes": 12345,
+  "status": "READY", "created_at": "2026-09-25T12:00:00Z",
+  "uploaded_at": null, "drive_file_id": null
+}
+```
+
+Exemplo de recurso inexistente:
+
+```json
+{"detail":"solution_not_found","error":{"code":"solution_not_found","message":"solution_not_found"}}
+```
 
 Para testar somente a API local:
 
